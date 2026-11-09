@@ -5,9 +5,22 @@ export interface TtsOptions {
   speed: number;
 }
 
+/** PCM timeline in seconds: start includes preceding pauses; duration excludes them. */
+export interface TtsCue {
+  text: string;
+  start: number;
+  duration: number;
+}
+
+export interface TtsResult {
+  blob: Blob;
+  duration: number;
+  cues: TtsCue[];
+}
+
 type WorkerReply =
   | { type: 'progress'; message: string; percent?: number }
-  | { type: 'result'; blob: Blob; duration: number }
+  | ({ type: 'result' } & TtsResult)
   | { type: 'error'; message: string };
 
 /** Local Supertonic 3 inference. A single instance handles one request at a time. */
@@ -19,7 +32,7 @@ export class TtsEngine {
   async generate(
     options: TtsOptions,
     progress: (message: string, percent?: number) => void,
-  ): Promise<{ blob: Blob; duration: number }> {
+  ): Promise<TtsResult> {
     if (this.disposed) throw new Error('이미 종료된 음성 엔진입니다. 새 엔진을 만들어 주세요.');
     if (this.pending) throw new Error('이미 음성을 생성 중입니다. 완료 후 다시 시도해 주세요.');
     if (typeof options.text !== 'string' || !options.text.trim()) throw new Error('읽을 텍스트를 입력해 주세요.');
@@ -58,7 +71,7 @@ export class TtsEngine {
           try { progress(reply.message, reply.percent); } catch { /* UI callbacks must not break inference. */ }
         } else if (reply.type === 'result') {
           cleanup();
-          resolve({ blob: reply.blob, duration: reply.duration });
+          resolve({ blob: reply.blob, duration: reply.duration, cues: reply.cues });
         } else if (reply.type === 'error') {
           // The worker deliberately remains alive: failed downloads can be retried.
           cleanup();

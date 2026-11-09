@@ -1,6 +1,6 @@
 import * as ort from 'onnxruntime-web/webgpu';
 import { Mp3Encoder } from '@breezystack/lamejs';
-import type { TtsOptions } from './tts-engine';
+import type { TtsCue, TtsOptions, TtsResult } from './tts-engine';
 
 // Local emitted asset, not a CDN version: the WASM binary must match the JS runtime.
 import wasmUrl from '../../../node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.jsep.wasm?url';
@@ -296,12 +296,13 @@ function appendPcm(encoder: Mp3Encoder, parts: Uint8Array[], samples: Float32Arr
   }
 }
 
-async function render(e: Engine, options: TtsOptions, style: Style): Promise<{ blob: Blob; duration: number }> {
+async function render(e: Engine, options: TtsOptions, style: Style): Promise<TtsResult> {
   const chunks = splitText(options.text, options.lang).filter(chunk => normalizeText(chunk, options.lang));
   if (!chunks.length) throw new Error('읽을 텍스트를 입력해 주세요.');
   const sampleRate = e.config.ae.sample_rate;
   const encoder = new Mp3Encoder(1, sampleRate, 128);
   const parts: Uint8Array[] = [];
+  const cues: TtsCue[] = [];
   let sampleCount = 0;
   for (let i = 0; i < chunks.length; i++) {
     if (i) {
@@ -310,6 +311,7 @@ async function render(e: Engine, options: TtsOptions, style: Style): Promise<{ b
       sampleCount += silence.length;
     }
     const wav = await synthesizeChunk(e, chunks[i], options, style, i, chunks.length);
+    cues.push({ text: chunks[i], start: sampleCount / sampleRate, duration: wav.length / sampleRate });
     appendPcm(encoder, parts, wav);
     sampleCount += wav.length;
   }
@@ -320,7 +322,7 @@ async function render(e: Engine, options: TtsOptions, style: Style): Promise<{ b
   // Copy to plain ArrayBuffers for BlobPart compatibility with TS 5.9.
   const blob = new Blob(parts.map((part) => part.buffer as ArrayBuffer), { type: 'audio/mpeg' });
   report('음성 생성이 완료되었습니다.', 100);
-  return { blob, duration: sampleCount / sampleRate };
+  return { blob, duration: sampleCount / sampleRate, cues };
 }
 
 self.onmessage = async (event: MessageEvent<{ type: 'generate'; options: TtsOptions }>) => {
@@ -333,7 +335,7 @@ self.onmessage = async (event: MessageEvent<{ type: 'generate'; options: TtsOpti
     report('음성 엔진을 준비하고 있습니다…', 0);
     let active = await getEngine();
     const style = await voiceStyle(options.voice);
-    let result: { blob: Blob; duration: number };
+    let result: TtsResult;
     try {
       result = await render(active, options, style);
     } catch (error) {
