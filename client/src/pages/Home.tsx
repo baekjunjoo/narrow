@@ -300,9 +300,9 @@ export default function Home() {
                   <label className="sound-range" htmlFor="music-volume">음악 크기 <strong>{Math.round(musicVolume * 100)}%</strong></label><input className="sound-slider" id="music-volume" type="range" min="0" max="1" step="0.1" value={musicVolume} onChange={event => setMusicVolume(Number(event.target.value))} disabled={busy || !music} />
                   <label className="sound-toggle"><input type="checkbox" checked={effects} onChange={event => setEffects(event.target.checked)} disabled={busy} /><span><strong>장면 효과음</strong><small>원고 속 단서에 맞춰 자동으로 넣어요</small></span></label>
                   <label className="sound-range" htmlFor="effects-volume">효과음 크기 <strong>{Math.round(effectsVolume * 100)}%</strong></label><input className="sound-slider" id="effects-volume" type="range" min="0" max="1" step="0.1" value={effectsVolume} onChange={event => setEffectsVolume(Number(event.target.value))} disabled={busy || !effects} />
-                  <label className="sound-toggle"><input type="checkbox" checked={spatial} onChange={event => setSpatial(event.target.checked)} disabled={busy || (!music && !effects)} /><span><strong>입체 음향 · 이어폰 권장</strong><small>효과음에 좌우 공간감을 더해요</small></span></label>
-                  <p id="sound-help">비, 숲, 바다, 발소리, 문, 책장 단어를 찾는 방식이에요. 자동 배치는 문맥과 위치가 정확하지 않을 수 있어 완성 후 꼭 들어봐 주세요.</p>
-                  <p>입체 모드는 2채널 헤드폰용 시제품이며, 돌비 애트모스나 영화관 다채널 믹스는 아닙니다.</p>
+                  <label className="sound-toggle"><input type="checkbox" checked={spatial} onChange={event => setSpatial(event.target.checked)} disabled={busy || (!music && !effects)} /><span><strong>입체 음향 · 이어폰 권장</strong><small>효과음에 창작적인 방향과 거리감을 더해요</small></span></label>
+                  <p id="sound-help">비, 숲, 바다, 발소리, 문, 책장 단서를 찾고 낭독의 쉼을 참고해 배치합니다. 단어별 정확한 정렬은 아니므로 문맥과 타이밍을 꼭 확인해 주세요.</p>
+                  <p>입체 모드는 개인 맞춤이 아닌 2채널 헤드폰용 시제품입니다. 방향·거리감은 창작적인 연출이며 돌비 애트모스나 영화관 다채널 믹스가 아닙니다.</p>
                   <p>음향 포함 작업은 최대 10분까지 지원합니다. 시험용 AI 생성 음향이므로 상업 배포 전 이용 권리를 확인해 주세요.</p>
                 </fieldset>
                 <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>

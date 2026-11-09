@@ -30,6 +30,7 @@ let assetRightLevel = 0.01;
 let assetChannels = 1;
 let renderedLeftLevel = 0.1;
 let renderedRightLevel = 0.1;
+let voiceTailSilence = false;
 let hrtfFailure: 'none' | 'create' | 'configure' = 'none';
 let stereoFailure = false;
 
@@ -46,6 +47,7 @@ class FakeParam {
   values: number[] = [];
   setValueAtTime(value: number) { this.values.push(value); }
   linearRampToValueAtTime(value: number) { this.values.push(value); }
+  setTargetAtTime(value: number) { this.values.push(value); }
 }
 class FakeGain {
   gain = new FakeParam();
@@ -90,7 +92,13 @@ class FakeAudioContext {
   async decodeAudioData() {
     const isVoice = this.decodeCount++ === 0;
     const result = new FakeBuffer(isVoice ? voiceDuration : 4, isVoice ? 1 : assetChannels);
-    if (!isVoice) {
+    if (isVoice) {
+      result.sampleRate = 1000;
+      result.length = Math.round(voiceDuration * result.sampleRate);
+      result.data = new Float32Array(result.length).fill(0.1);
+      result.rightData = new Float32Array(result.length).fill(0.1);
+      if (voiceTailSilence) result.data.fill(0, Math.floor(result.length * 0.9));
+    } else {
       result.data.fill(assetLevel);
       result.rightData.fill(assetRightLevel);
     }
@@ -157,6 +165,7 @@ beforeEach(() => {
   assetChannels = 1;
   renderedLeftLevel = 0.1;
   renderedRightLevel = 0.1;
+  voiceTailSilence = false;
   hrtfFailure = 'none';
   stereoFailure = false;
   offlineInstances = [];
@@ -192,6 +201,32 @@ describe('mixSoundscape', () => {
     expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
     expect(result.blob.type).toBe('audio/mpeg');
     expect(result.warnings).toEqual([]);
+  });
+
+  it('allows one background and one action to overlap, without stacking nearby actions', async () => {
+    const result = await mixSoundscape(voice(), [
+      cue('비가', 0), cue('문을 열었다', 3), cue('발소리가', 6), cue('숲에', 7),
+    ], options);
+    expect(result.events.map((event) => event.label)).toEqual(['빗소리', '문 여닫는 소리', '숲']);
+  });
+
+  it('moves a final action earlier within its cue when needed to leave audible output', async () => {
+    voiceDuration = 3;
+    voiceTailSilence = true;
+    const result = await mixSoundscape(voice(), [cue('문을 열었다.', 0, 3)], options);
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].time).toBeLessThanOrEqual(2.2);
+    const source = offlineInstances[0].sources[1];
+    expect(source.stopTime - source.startTime).toBeGreaterThanOrEqual(0.799);
+  });
+
+  it('omits and explains a final effect when its cue is too short to play', async () => {
+    voiceDuration = 0.5;
+    const result = await mixSoundscape(voice(), [cue('문을 열었다.', 0, 0.5)], options);
+    expect(result.events).toEqual([]);
+    expect(offlineInstances[0].sources).toHaveLength(1);
+    expect(result.warnings.join(' ')).toContain('재생 시간이 부족한 효과음');
+    expect(result.warnings.join(' ')).not.toContain('단서를 찾지 못해');
   });
 
   it('recognizes concrete book and page actions but not mentions, negation or substring false positives', async () => {
@@ -287,7 +322,8 @@ describe('mixSoundscape', () => {
     expect(offline.sources[1].loop).toBe(true);
     expect(offline.sources.slice(2, 5).map((source) => source.gain?.channelCount)).toEqual([2, 2, 2]);
     expect(offline.sources.slice(5).map((source) => source.gain?.channelCount)).toEqual([1, 1, 1]);
-    expect(offline.panners.map((panner) => panner.pan.value)).toEqual([-0.12, 0.12]);
+    // Wide ambience now uses a mono-safe crossfeed matrix, not StereoPanner.
+    expect(offline.panners).toEqual([]);
     expect(offline.hrtfPanners.map((panner) => [panner.panningModel, panner.positionX.value, panner.positionY.value, panner.positionZ.value, panner.rolloffFactor])).toEqual([
       ['HRTF', -0.75, 0, -1, 0], ['HRTF', 0.75, 0, -1, 0], ['HRTF', 0, 0, -1, 0],
     ]);
@@ -313,9 +349,11 @@ describe('mixSoundscape', () => {
     stereoFailure = true;
     const result = await mixSoundscape(voice(), [cue('발소리가')], { ...options, spatial: true });
     const offline = offlineInstances[0];
-    expect(offline.sources[1].gain?.connections).toEqual([offline.destination]);
+    const distanceGain = offline.sources[1].gain?.connections[0] as FakeGain;
+    const soundBus = distanceGain.connections[0] as FakeGain;
+    expect(soundBus.connections).toEqual([offline.destination]);
     expect(result.events).toHaveLength(1);
-    expect(result.warnings.join(' ')).toContain('HRTF를 사용할 수 없어');
+    expect(result.warnings.join(' ')).not.toContain('일반 스테레오 패닝');
     expect(result.warnings.join(' ')).toContain('중앙에 배치');
   });
 
@@ -323,8 +361,8 @@ describe('mixSoundscape', () => {
     renderedLeftLevel = 2;
     renderedRightLevel = 1;
     await mixSoundscape(voice(), [], { ...options, effects: false, spatial: true });
-    expect(encoded.blocks[0].left[0]).toBe(Math.round(0.98 * 32767));
-    expect(encoded.blocks[0].right?.[0]).toBe(Math.round(0.49 * 32767));
+    expect(encoded.blocks[0].left[0]).toBe(Math.round(0.84 * 32767));
+    expect(encoded.blocks[0].right?.[0]).toBe(Math.round(0.42 * 32767));
   });
 
   it('rejects a non-boolean spatial option', async () => {

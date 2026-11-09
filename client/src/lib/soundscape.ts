@@ -1,4 +1,6 @@
 import { Mp3Encoder } from '@breezystack/lamejs';
+import { createCueTiming } from './sound-timing';
+import { connectBinaural, EFFECT_SPATIAL_PROFILES, makeMonoSafeAmbience, makeNarrationDucking, type SpatialProfile } from './sound-quality';
 
 /** Times and durations are in seconds on the decoded narration timeline. */
 export type Cue = { text: string; start: number; duration: number };
@@ -20,27 +22,18 @@ const MAX_SECONDS = 600;
 const MUSIC_GAIN = 0.065;
 const EFFECT_GAIN = 0.075;
 const VOICE_GAIN = 0.9;
+// Sample-peak headroom for MP3 encoding, not a true-peak or headphone SPL guarantee.
+const MIX_PEAK_LIMIT = 0.84;
 // Guard against unexpectedly loud test assets as well as the fixed attenuation.
 // This caps the loudest half-second asset window near -46 dBFS before MP3
 // encoding; it never boosts a quiet sound and is not narration-side ducking.
 const MAX_ASSET_WINDOW_RMS = 0.005;
-// Effects last at most six seconds, so this still prevents overlaps while
-// allowing different scenes in a short sample to be heard.
-const GLOBAL_EFFECT_GAP = 6;
+// At most one ambient and one discrete effect may overlap: keep six seconds
+// between starts in each group and two seconds between any two starts.
+const GROUP_EFFECT_GAP = 6;
+const GLOBAL_EFFECT_GAP = 2;
 const SAME_EFFECT_GAP = 30;
-
-// Headphone-oriented two-channel binaural/stereo, not multichannel audio.
-// Locations are illustrative only: they never encode narrative information.
-// Nature retains some original stereo ambience; discrete effects are mono first
-// so their apparent position does not depend on the source recording's balance.
-const SPATIAL_EFFECTS: Record<EffectName, { pan: number; wide: boolean }> = {
-  rain: { pan: -0.12, wide: true },
-  forest: { pan: 0.12, wide: true },
-  ocean: { pan: 0, wide: true },
-  footsteps: { pan: -0.25, wide: false },
-  door: { pan: 0.25, wide: false },
-  page: { pan: 0, wide: false },
-};
+const MIN_EFFECT_TAIL_SECONDS = 0.8;
 
 // A deliberately conservative, local keyword heuristic, not semantic analysis.
 // Korean suffixes are explicit so e.g. "비밀" and "바다표범" are not matches;
@@ -83,9 +76,10 @@ function isNegated(text: string, index: number, length: number): boolean {
     || /(?:지\s*(?:않|못)|없(?:다|었|어|는|던|이)|그쳤|멈췄)/.test(koreanContext);
 }
 
-function planEffects(cues: Cue[], duration: number): { plans: PlannedEffect[]; invalidCount: number } {
+function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans: PlannedEffect[]; invalidCount: number; tooShortCount: number } {
   const candidates: PlannedEffect[] = [];
   let invalidCount = 0;
+  let tooShortCount = 0;
   for (const cue of cues) {
     if (!cue || typeof cue.text !== 'string' || !Number.isFinite(cue.start) || !Number.isFinite(cue.duration)
       || cue.start < 0 || cue.start >= duration || cue.duration <= 0) {
@@ -94,6 +88,7 @@ function planEffects(cues: Cue[], duration: number): { plans: PlannedEffect[]; i
     }
     const span = Math.min(cue.duration, duration - cue.start);
     if (span <= 0 || !cue.text.length) continue;
+    let timing: ReturnType<typeof createCueTiming> | undefined;
     for (const rule of RULES) {
       // matchAll clones the regular expression, so state never leaks between cues.
       for (const match of cue.text.matchAll(rule.pattern)) {
@@ -101,9 +96,18 @@ function planEffects(cues: Cue[], duration: number): { plans: PlannedEffect[]; i
         const index = (match.index ?? 0) + prefixLength;
         const matched = match[2] ?? match[3] ?? '';
         if (!matched || isNegated(cue.text, index, matched.length)) continue;
-        // Text position is only an approximation *inside* the worker-provided
-        // exact chunk interval. It never uses a position from the full manuscript.
-        const time = cue.start + span * index / cue.text.length;
+        // Still an estimate, not word-level alignment. Analyze this cue's
+        // decoded narration only once, and fall back if its waveform is unclear.
+        timing ??= createCueTiming(cue, voice);
+        const discrete = rule.name === 'door' || rule.name === 'footsteps' || rule.name === 'page';
+        let time = timing.locate(index, matched.length, discrete);
+        // Never report a nominal event that is truncated to silence by the end
+        // of the narration. Shift locally inside the same cue when possible.
+        const latestStart = duration - MIN_EFFECT_TAIL_SECONDS;
+        if (time > latestStart) {
+          if (cue.start > latestStart) { tooShortCount++; continue; }
+          time = latestStart;
+        }
         candidates.push({ name: rule.name, label: rule.label, time, maxSeconds: rule.maxSeconds });
       }
     }
@@ -111,15 +115,19 @@ function planEffects(cues: Cue[], duration: number): { plans: PlannedEffect[]; i
   candidates.sort((a, b) => a.time - b.time);
   const plans: PlannedEffect[] = [];
   const lastByType = new Map<EffectName, number>();
+  const lastByGroup = new Map<'ambient' | 'discrete', number>();
   let last = -Infinity;
   for (const candidate of candidates) {
+    const group = candidate.name === 'rain' || candidate.name === 'forest' || candidate.name === 'ocean' ? 'ambient' : 'discrete';
     if (candidate.time - last < GLOBAL_EFFECT_GAP
+      || candidate.time - (lastByGroup.get(group) ?? -Infinity) < GROUP_EFFECT_GAP
       || candidate.time - (lastByType.get(candidate.name) ?? -Infinity) < SAME_EFFECT_GAP) continue;
     plans.push(candidate);
     last = candidate.time;
+    lastByGroup.set(group, candidate.time);
     lastByType.set(candidate.name, candidate.time);
   }
-  return { plans, invalidCount };
+  return { plans, invalidCount, tooShortCount };
 }
 
 function errorMessage(error: unknown): string {
@@ -259,9 +267,7 @@ function safeAssetGain(buffer: AudioBuffer, maxSeconds: number, baseGain: number
   return Math.min(baseGain, maxRms > 0 ? MAX_ASSET_WINDOW_RMS / maxRms : baseGain) * userVolume;
 }
 
-type SpatialPlacement = { pan: number; wide: boolean };
-
-function scheduleFadedSource(context: OfflineAudioContext, buffer: AudioBuffer, start: number, duration: number, gainValue: number, loop: boolean, placement?: SpatialPlacement, warnFallback?: (centered?: boolean) => void): void {
+function scheduleFadedSource(context: OfflineAudioContext, buffer: AudioBuffer, start: number, duration: number, gainValue: number, loop: boolean, destination: AudioNode, placement?: SpatialProfile, warnFallback?: (centered?: boolean) => void): void {
   if (duration <= 0) return;
   const node = context.createBufferSource();
   const gain = context.createGain();
@@ -269,78 +275,9 @@ function scheduleFadedSource(context: OfflineAudioContext, buffer: AudioBuffer, 
   node.loop = loop;
   node.connect(gain);
   if (!placement) {
-    // Preserve the existing mono graph and bit-for-bit behavior when disabled.
-    gain.connect(context.destination);
-  } else if (placement.wide) {
-    // A 25%-width L/R matrix preserves (L+R)/2 without artificial delays or
-    // polarity flips. Speakers upmix a mono source before the splitter.
-    gain.channelCount = 2;
-    gain.channelCountMode = 'explicit';
-    gain.channelInterpretation = 'speakers';
-    const split = context.createChannelSplitter(2);
-    const merge = context.createChannelMerger(2);
-    gain.connect(split);
-    for (let input = 0; input < 2; input++) {
-      for (let output = 0; output < 2; output++) {
-        const matrixGain = context.createGain();
-        // Extra headroom also covers the mild pan applied to nature sounds.
-        matrixGain.gain.value = 0.85 * (input === output ? 0.625 : 0.375);
-        split.connect(matrixGain, input);
-        matrixGain.connect(merge, 0, output);
-      }
-    }
-    if (placement.pan) {
-      try {
-        const pan = context.createStereoPanner();
-        pan.pan.value = placement.pan;
-        pan.connect(context.destination);
-        merge.connect(pan);
-      } catch {
-        merge.disconnect();
-        merge.connect(context.destination);
-        warnFallback?.(true);
-      }
-    } else {
-      merge.connect(context.destination);
-    }
+    gain.connect(destination);
   } else {
-    // A mono source into the generic HRTF renderer; modest azimuths keep the
-    // far ear audible. Listener default orientation faces -Z. No distance gain.
-    gain.channelCount = 1;
-    gain.channelCountMode = 'explicit';
-    gain.channelInterpretation = 'speakers';
-    try {
-      const pan = context.createPanner();
-      pan.panningModel = 'HRTF';
-      if (pan.panningModel !== 'HRTF') throw new Error('HRTF unavailable');
-      pan.distanceModel = 'inverse';
-      pan.rolloffFactor = 0;
-      // pan -0.25/0.25 -> x -0.75/0.75; page remains straight ahead.
-      const x = placement.pan * 3;
-      if (pan.positionX && pan.positionY && pan.positionZ) {
-        pan.positionX.value = x;
-        pan.positionY.value = 0;
-        pan.positionZ.value = -1;
-      } else {
-        pan.setPosition(x, 0, -1);
-      }
-      pan.connect(context.destination);
-      gain.connect(pan);
-    } catch {
-      // A failed connection must not leave a partially connected HRTF path.
-      gain.disconnect();
-      warnFallback?.();
-      try {
-        const pan = context.createStereoPanner();
-        pan.pan.value = placement.pan;
-        pan.connect(context.destination);
-        gain.connect(pan);
-      } catch {
-        gain.disconnect();
-        gain.connect(context.destination);
-        warnFallback?.(true);
-      }
-    }
+    connectBinaural(context, gain, placement, destination, warnFallback ?? (() => {}));
   }
   const fade = Math.min(loop ? 0.5 : 0.04, duration / 2);
   const fadeOut = Math.min(loop ? 0.8 : 0.15, duration / 2);
@@ -363,7 +300,7 @@ async function encodeMp3(buffer: AudioBuffer, onProgress?: (message: string) => 
   for (let i = 0; i < samples.length; i++) {
     peak = Math.max(peak, Math.abs(samples[i]), rightSamples ? Math.abs(rightSamples[i]) : 0);
   }
-  const scale = peak > 0.98 ? 0.98 / peak : 1;
+  const scale = peak > MIX_PEAK_LIMIT ? MIX_PEAK_LIMIT / peak : 1;
   const encoder = new Mp3Encoder(rightSamples ? 2 : 1, buffer.sampleRate, rightSamples ? 192 : 128);
   const parts: ArrayBuffer[] = [];
   const blockSize = 1152;
@@ -401,7 +338,7 @@ async function encodeMp3(buffer: AudioBuffer, onProgress?: (message: string) => 
  * Mix a local narration MP3 and same-origin sound assets entirely in the browser.
  * Returns a mono MP3 by default, or two-channel headphone audio with generic
  * HRTF on discrete effects when available. This is not Dolby Atmos or 5.1.
- * Event times are approximate within each cue; no ducking or speech recognition.
+ * Event times use decoded voice energy as an approximation, not speech recognition.
  */
 export async function mixSoundscape(
   voiceBlob: Blob,
@@ -467,9 +404,10 @@ export async function mixSoundscape(
     const effectsEnabled = options.effects && options.effectsVolume > 0;
     if (options.music && !musicEnabled) warnings.push('배경음 음량이 0이어서 배경음을 추가하지 않았습니다.');
     if (options.effects && !effectsEnabled) warnings.push('효과음 음량이 0이어서 효과음을 추가하지 않았습니다.');
-    const { plans, invalidCount } = effectsEnabled ? planEffects(cues, voice.duration) : { plans: [], invalidCount: 0 };
+    const { plans, invalidCount, tooShortCount } = effectsEnabled ? planEffects(cues, voice.duration, voice) : { plans: [], invalidCount: 0, tooShortCount: 0 };
     if (invalidCount) warnings.push(`시간 정보가 올바르지 않은 음성 구간 ${invalidCount}개는 효과음 분석에서 제외했습니다.`);
-    if (effectsEnabled && !plans.length) warnings.push('원고에서 효과음을 넣을 만한 단서를 찾지 못해 효과음을 추가하지 않았습니다.');
+    if (tooShortCount) warnings.push(`끝부분에 재생 시간이 부족한 효과음 ${tooShortCount}개는 생략했습니다.`);
+    if (effectsEnabled && !plans.length && !tooShortCount) warnings.push('원고에서 효과음을 넣을 만한 단서를 찾지 못해 효과음을 추가하지 않았습니다.');
 
     const assets = new Map<string, AudioBuffer>();
     // Request the same effect assets in the same order, including when no cues
@@ -479,9 +417,11 @@ export async function mixSoundscape(
       throwIfAborted(signal);
       report(`음향 파일을 불러옵니다… (${i + 1}/${names.length})`);
       throwIfAborted(signal);
-      assets.set(names[i], await loadAsset(decoder, names[i], signal));
+      const asset = await loadAsset(decoder, names[i], signal);
+      assets.set(names[i], makeMonoSafeAmbience(decoder, asset));
     }
     throwIfAborted(signal);
+    const scheduled: PlannedEffect[] = [];
     const releaseOffline = await acquireOfflineSlot(report, signal);
     let renderingStarted = false;
     let rendered: AudioBuffer;
@@ -511,23 +451,30 @@ export async function mixSoundscape(
         voiceSource.connect(voiceGain);
         voiceGain.connect(offline.destination);
         voiceSource.start(0);
+        // Narration remains dry and centered; only the shared sound bed is ducked.
+        const soundBus = makeNarrationDucking(offline, voice);
         const music = assets.get('music-calm');
         if (music) {
           const loop = makeMusicLoop(decoder, music, spatial);
           assets.delete('music-calm');
           const musicGain = safeAssetGain(loop, loop.duration, MUSIC_GAIN, options.musicVolume, spatial);
-          scheduleFadedSource(offline, loop, 0, voice.duration, musicGain, true, spatial ? { pan: 0, wide: true } : undefined, warnFallback);
+          scheduleFadedSource(offline, loop, 0, voice.duration, musicGain, true, soundBus, spatial ? { pan: 0, wide: true, depth: 0 } : undefined, warnFallback);
         }
         const effectGains = new Map<EffectName, number>();
         for (const plan of plans) {
           const effect = assets.get(plan.name)!;
           const length = Math.min(effect.duration, plan.maxSeconds, voice.duration - plan.time);
+          if (length <= 0.001) {
+            warnings.push(`재생할 수 없는 ${plan.label} 효과음은 생략했습니다.`);
+            continue;
+          }
           let effectGain = effectGains.get(plan.name);
           if (effectGain === undefined) {
             effectGain = safeAssetGain(effect, plan.maxSeconds, EFFECT_GAIN, options.effectsVolume, spatial);
             effectGains.set(plan.name, effectGain);
           }
-          scheduleFadedSource(offline, effect, plan.time, length, effectGain, false, spatial ? SPATIAL_EFFECTS[plan.name] : undefined, warnFallback);
+          scheduleFadedSource(offline, effect, plan.time, length, effectGain, false, soundBus, spatial ? EFFECT_SPATIAL_PROFILES[plan.name] : undefined, warnFallback);
+          scheduled.push(plan);
         }
       } catch (error) {
         throw new Error(`오디오 믹싱을 준비하지 못했습니다. 브라우저 메모리를 확인해 주세요: ${errorMessage(error)}`);
@@ -558,7 +505,7 @@ export async function mixSoundscape(
     }
     throwIfAborted(signal);
     report('오디오 믹싱이 완료되었습니다.');
-    return { blob, events: plans.map(({ label, time }) => ({ label, time })), warnings };
+    return { blob, events: scheduled.map(({ label, time }) => ({ label, time })), warnings };
   } finally {
     try {
       const closing = decoder.close();
