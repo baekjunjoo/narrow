@@ -138,6 +138,44 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DOMException('오디오 믹싱이 취소되었습니다.', 'AbortError');
 }
 
+// Count both a mix's lifetime and its non-cancellable physical operations.
+// Keeping the lifetime counted closes gaps between a fulfilled promise and the
+// next decode/render, and ensures cancellation has finished scheduling cleanup.
+let soundscapeWork = 0;
+const idleWaiters = new Set<() => void>();
+
+function beginSoundscapeWork(): () => void {
+  soundscapeWork++;
+  return () => {
+    soundscapeWork--;
+    if (soundscapeWork === 0) {
+      const waiters = [...idleWaiters];
+      idleWaiters.clear();
+      waiters.forEach((resolve) => resolve());
+    }
+  };
+}
+
+function trackPhysical<T>(operation: Promise<T>): Promise<T> {
+  const finish = beginSoundscapeWork();
+  // Handle both outcomes without creating an unhandled rejecting promise.
+  void operation.then(finish, finish);
+  return operation;
+}
+
+/** Synchronous snapshot for UI locking; callers must still wait for idle. */
+export function hasPendingSoundscapeWork(): boolean {
+  return soundscapeWork > 0;
+}
+
+/** Wait for active mixes and their underlying browser operations to settle.
+ * New work must be prevented by the caller while it is waiting. */
+export async function waitForSoundscapeIdle(): Promise<void> {
+  while (soundscapeWork > 0) {
+    await new Promise<void>((resolve) => idleWaiters.add(resolve));
+  }
+}
+
 /** Stop waiting immediately; Web Audio's in-flight decode/render may continue internally. */
 function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
   if (!signal) return operation;
@@ -182,14 +220,17 @@ async function loadAsset(context: AudioContext, filename: string, signal?: Abort
   try {
     throwIfAborted(signal);
     const response = await abortable(fetch(url, { credentials: 'same-origin', signal }), signal);
+    throwIfAborted(signal);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    bytes = await abortable(response.arrayBuffer(), signal);
+    throwIfAborted(signal);
+    bytes = await abortable(trackPhysical(response.arrayBuffer()), signal);
   } catch (error) {
     throwIfAborted(signal);
     throw new Error(`음향 파일 ${url}을 불러오지 못했습니다: ${errorMessage(error)}`);
   }
   try {
-    const result = await abortable(context.decodeAudioData(bytes), signal);
+    throwIfAborted(signal);
+    const result = await abortable(trackPhysical(context.decodeAudioData(bytes)), signal);
     if (!result.length || !result.duration) throw new Error('빈 오디오 파일입니다.');
     return result;
   } catch (error) {
@@ -347,6 +388,21 @@ export async function mixSoundscape(
   onProgress?: (message: string) => void,
   signal?: AbortSignal,
 ): Promise<MixResult> {
+  const finish = beginSoundscapeWork();
+  try {
+    return await mixSoundscapeInternal(voiceBlob, cues, options, onProgress, signal);
+  } finally {
+    finish();
+  }
+}
+
+async function mixSoundscapeInternal(
+  voiceBlob: Blob,
+  cues: Cue[],
+  options: MixOptions,
+  onProgress?: (message: string) => void,
+  signal?: AbortSignal,
+): Promise<MixResult> {
   throwIfAborted(signal);
   if (!(voiceBlob instanceof Blob) || voiceBlob.size === 0) throw new Error('낭독 오디오가 비어 있습니다.');
   if (!Array.isArray(cues)) throw new Error('음성 구간 정보가 올바르지 않습니다.');
@@ -365,6 +421,7 @@ export async function mixSoundscape(
 
   const report = (message: string) => { if (!signal?.aborted) onProgress?.(message); };
   report('낭독 오디오를 브라우저에서 불러옵니다…');
+  throwIfAborted(signal);
   let decoder: AudioContext;
   try {
     decoder = new AudioContextClass({ sampleRate: SAMPLE_RATE });
@@ -374,9 +431,9 @@ export async function mixSoundscape(
   try {
     let voice: AudioBuffer;
     try {
-      const voiceBytes = await abortable(voiceBlob.arrayBuffer(), signal);
+      const voiceBytes = await abortable(trackPhysical(voiceBlob.arrayBuffer()), signal);
       throwIfAborted(signal);
-      voice = await abortable(decoder.decodeAudioData(voiceBytes), signal);
+      voice = await abortable(trackPhysical(decoder.decodeAudioData(voiceBytes)), signal);
       if (!voice.length || !Number.isFinite(voice.duration) || voice.duration <= 0) throw new Error('빈 오디오입니다.');
     } catch (error) {
       throwIfAborted(signal);
@@ -480,7 +537,7 @@ export async function mixSoundscape(
         throw new Error(`오디오 믹싱을 준비하지 못했습니다. 브라우저 메모리를 확인해 주세요: ${errorMessage(error)}`);
       }
       try {
-        const rendering = offline.startRendering();
+        const rendering = trackPhysical(offline.startRendering());
         // Abort only stops our wait: the browser may still be rendering. Release
         // the slot on the physical promise's settlement, even after cancellation.
         void rendering.then(releaseOffline, releaseOffline);
@@ -508,7 +565,7 @@ export async function mixSoundscape(
     return { blob, events: scheduled.map(({ label, time }) => ({ label, time })), warnings };
   } finally {
     try {
-      const closing = decoder.close();
+      const closing = trackPhysical(decoder.close());
       if (signal?.aborted) void closing.catch(() => undefined);
       else await closing;
     } catch { /* best-effort release */ }

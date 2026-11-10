@@ -4,7 +4,8 @@ import {
   FileText, Headphones, Info, LoaderCircle, Pause, Play, Sparkles, Upload, Volume2,
 } from "lucide-react";
 import { TtsEngine } from "@/lib/tts-engine";
-import { mixSoundscape, type Cue, type MixOptions } from "@/lib/soundscape";
+import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type MixOptions } from "@/lib/soundscape";
+import BatchConverter from "@/components/BatchConverter";
 
 type Language = "ko" | "en";
 type Result = {
@@ -37,14 +38,18 @@ function formatTime(seconds: number) {
 }
 
 export default function Home() {
+  // A previous Home may have unmounted while Web Audio was still working.
+  const initialSoundscapeWait = useRef(hasPendingSoundscapeWork());
   const [lang, setLang] = useState<Language>("ko");
   const [text, setText] = useState("");
   const [title, setTitle] = useState("나의 오디오북");
   const [voice, setVoice] = useState("F1");
   const [speed, setSpeed] = useState(0.95);
   const [playingPreview, setPlayingPreview] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(initialSoundscapeWait.current);
+  const [waitingForSoundscape, setWaitingForSoundscape] = useState(initialSoundscapeWait.current);
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [status, setStatus] = useState(initialSoundscapeWait.current ? "이전 음향 처리가 마무리될 때까지 기다리고 있어요" : "");
   const [progress, setProgress] = useState<number | undefined>();
   const [error, setError] = useState("");
   const [result, setResult] = useState<Result | null>(null);
@@ -66,13 +71,24 @@ export default function Home() {
   const currentMix: MixOptions = { music, effects, musicVolume, effectsVolume, spatial };
   const settingsChanged = result?.mixOptions && JSON.stringify(result.mixOptions) !== JSON.stringify(currentMix);
 
-  useEffect(() => () => {
-    operation.current++;
-    mixAbort.current?.abort();
-    engine.current?.dispose();
-    previewAudio.current?.pause();
-    if (generatedUrl.current) URL.revokeObjectURL(generatedUrl.current);
-    if (mixedUrl.current) URL.revokeObjectURL(mixedUrl.current);
+  useEffect(() => {
+    const id = operation.current;
+    if (initialSoundscapeWait.current) {
+      void waitForSoundscapeIdle().then(() => {
+        if (operation.current !== id) return;
+        setWaitingForSoundscape(false);
+        setBusy(false);
+        setStatus("");
+      });
+    }
+    return () => {
+      operation.current++;
+      mixAbort.current?.abort();
+      engine.current?.dispose();
+      previewAudio.current?.pause();
+      if (generatedUrl.current) URL.revokeObjectURL(generatedUrl.current);
+      if (mixedUrl.current) URL.revokeObjectURL(mixedUrl.current);
+    };
   }, []);
 
   const changeLanguage = (next: Language) => {
@@ -119,6 +135,8 @@ export default function Home() {
   };
 
   const generate = async () => {
+    if (busy) return;
+    if (batchBusy) { setError("일괄 변환 또는 ZIP 준비가 끝난 뒤 제작을 시작해 주세요."); return; }
     if (!text.trim()) { setError("먼저 읽을 원고를 입력해 주세요."); return; }
     if (text.length > 10000) { setError("안정적인 제작을 위해 원고를 10,000자 이하로 나눠 입력해 주세요."); return; }
     const id = ++operation.current;
@@ -181,19 +199,32 @@ export default function Home() {
   };
 
   const cancel = () => {
-    operation.current++;
+    if (waitingForSoundscape) return;
+    const id = ++operation.current;
     mixAbort.current?.abort();
     mixAbort.current = null;
     engine.current?.dispose();
     engine.current = null;
-    setBusy(false);
     setProgress(undefined);
     setError("");
-    setStatus("제작을 취소했습니다. 입력한 원고는 그대로 남아 있어요.");
+    if (!hasPendingSoundscapeWork()) {
+      setBusy(false);
+      setStatus("제작을 취소했습니다. 입력한 원고는 그대로 남아 있어요.");
+      return;
+    }
+    setBusy(true);
+    setWaitingForSoundscape(true);
+    setStatus("이전 음향 처리가 마무리될 때까지 기다리고 있어요");
+    void waitForSoundscapeIdle().then(() => {
+      if (operation.current !== id) return;
+      setWaitingForSoundscape(false);
+      setBusy(false);
+      setStatus("제작을 취소했습니다. 입력한 원고는 그대로 남아 있어요.");
+    });
   };
 
   const remix = async () => {
-    if (!result || busy) return;
+    if (!result || busy || batchBusy) return;
     const id = ++operation.current;
     setError("");
     if (!currentMix.music && !currentMix.effects) {
@@ -259,6 +290,7 @@ export default function Home() {
           </div>
 
           <div className="steps" aria-label="제작 과정"><span><b>01</b> 원고 입력</span><i /><span><b>02</b> 목소리 선택</span><i /><span><b>03</b> 제작 및 다운로드</span></div>
+          <p className="batch-shortcut">이미 완성된 오디오가 있으신가요? <a href="#batch-converter">여러 파일 형식 한꺼번에 변환하기 <ArrowRight size={14} aria-hidden="true" /></a></p>
 
           <div className="workspace-grid">
             <div className="left-column">
@@ -305,8 +337,9 @@ export default function Home() {
                   <p>입체 모드는 개인 맞춤이 아닌 2채널 헤드폰용 시제품입니다. 방향·거리감은 창작적인 연출이며 돌비 애트모스나 영화관 다채널 믹스가 아닙니다.</p>
                   <p>음향 포함 작업은 최대 10분까지 지원합니다. 시험용 AI 생성 음향이므로 상업 배포 전 이용 권리를 확인해 주세요.</p>
                 </fieldset>
-                <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
-                {busy && <div className="progress-box" role="status"><div className="progress-head"><span>{status}</span>{typeof progress === "number" && <strong>{Math.round(progress)}%</strong>}</div><div className="progress-track"><span style={{ width: `${typeof progress === "number" ? Math.max(3, Math.min(100, progress)) : 8}%` }} /></div><p>긴 원고는 시간이 걸릴 수 있어요. 제작 중 이 페이지를 열어 두세요.</p><button type="button" className="cancel-btn" onClick={cancel}>제작 취소</button></div>}
+                <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy || batchBusy}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
+                {batchBusy && <p className="batch-busy-note" role="status">일괄 변환 또는 ZIP 준비가 진행 중입니다. 끝난 뒤 오디오를 제작할 수 있어요.</p>}
+                {busy && <div className="progress-box" role="status"><div className="progress-head"><span>{status}</span>{typeof progress === "number" && <strong>{Math.round(progress)}%</strong>}</div><div className="progress-track"><span style={{ width: `${typeof progress === "number" ? Math.max(3, Math.min(100, progress)) : 8}%` }} /></div><p>{waitingForSoundscape ? "브라우저에서 이미 시작한 음향 작업은 즉시 중단할 수 없어 오래 걸릴 수 있습니다. 작업이 끝날 때까지 새 오디오 작업을 시작할 수 없어요." : "긴 원고는 시간이 걸릴 수 있어요. 제작 중 이 페이지를 열어 두세요."}</p><button type="button" className="cancel-btn" onClick={cancel} disabled={waitingForSoundscape}>{waitingForSoundscape ? "처리 종료 대기 중" : "제작 취소"}</button></div>}
                 {!busy && status.startsWith("제작을 취소") && <div className="cancel-notice" role="status">{status}</div>}
                 {error && <div role="alert" className="error-box"><Info size={16} /> {error}</div>}
                 <div className="privacy-note"><span><Check size={13} /></span><p><strong>원고는 내 기기에서 처리돼요</strong><br />음성 합성 서버에 원고를 보내지 않습니다.</p></div>
@@ -323,12 +356,13 @@ export default function Home() {
                   {result.events && result.events.length > 0 && <div className="cue-summary"><strong>자동 배치된 효과음</strong><p>{result.events.map(event => `${formatTime(event.time)} ${event.label}`).join(" · ")}</p></div>}
                   {result.warnings?.map((warning, index) => <p className="sound-warning" key={`${index}-${warning}`}>{warning}</p>)}
                   {settingsChanged && <p className="sound-warning">음향 설정을 변경했습니다. 아래 버튼으로 기존 낭독에 다시 적용해 주세요.</p>}
-                  {(settingsChanged || (!result.mixOptions && (music || effects))) && <button type="button" className="remix-btn" onClick={() => void remix()} disabled={busy}>완성된 낭독에 음향 설정 다시 적용</button>}
+                  {(settingsChanged || (!result.mixOptions && (music || effects))) && <button type="button" className="remix-btn" onClick={() => void remix()} disabled={busy || batchBusy}>완성된 낭독에 음향 설정 다시 적용</button>}
                   <p>음향 파일은 합쳐진 MP3라서 재생 중 소리별 조절은 되지 않습니다. 새로 제작하면 기존 결과가 교체되므로 필요한 파일은 먼저 다운로드해 주세요. 새로고침하면 화면의 결과는 사라집니다.</p></div> : <div className="output-empty"><div className="empty-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><strong>아직 만들어진 오디오가 없어요</strong><p>원고와 목소리를 선택하고<br />오디오를 만들어 보세요.</p></div>}
               </section>
               <div className="model-note"><CircleHelp size={15} /><p>처음 제작할 때 공개 모델 약 380MB를 다운로드합니다. 컴퓨터 성능과 인터넷 속도에 따라 시간이 걸릴 수 있어요.</p></div>
             </aside>
           </div>
+          <BatchConverter otherBusy={busy} onBusyChange={setBatchBusy} />
           <footer><span>© 텍타일오디오 · AI 생성 음성</span><span>Supertonic 3 · <a href="/licenses/index.html" target="_blank" rel="noreferrer">오픈소스 및 이용 조건</a></span></footer>
         </div>
       </main>

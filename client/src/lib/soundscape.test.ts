@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mixSoundscape, type Cue, type MixOptions } from './soundscape';
+import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type MixOptions } from './soundscape';
 
 const encoded = vi.hoisted(() => ({
   settings: [] as { channels: number; rate: number; bitrate: number }[],
@@ -25,6 +25,11 @@ let syncRenderFailure = false;
 let offlineConstructionFailure = false;
 let renderStarts = 0;
 let pendingRenders: { promise: Promise<FakeBuffer>; resolve: () => void; reject: (reason: Error) => void }[] = [];
+let pendingDecode: 'voice' | 'asset' | undefined;
+let pendingDecodes: { promise: Promise<FakeBuffer>; resolve: () => void; reject: (reason: Error) => void }[] = [];
+let pendingReads: { promise: Promise<ArrayBuffer>; resolve: () => void; reject: (reason: Error) => void }[] = [];
+let pendingClose = false;
+let pendingCloses: { promise: Promise<void>; resolve: () => void; reject: (reason: Error) => void }[] = [];
 let assetLevel = 0.01;
 let assetRightLevel = 0.01;
 let assetChannels = 1;
@@ -102,6 +107,16 @@ class FakeAudioContext {
       result.data.fill(assetLevel);
       result.rightData.fill(assetRightLevel);
     }
+    if (pendingDecode === (isVoice ? 'voice' : 'asset')) {
+      let resolve!: () => void;
+      let reject!: (reason: Error) => void;
+      const promise = new Promise<FakeBuffer>((ok, fail) => {
+        resolve = () => ok(result);
+        reject = fail;
+      });
+      pendingDecodes.push({ promise, resolve, reject });
+      return promise;
+    }
     return result;
   }
   createBuffer(channels: number, length: number) {
@@ -111,7 +126,16 @@ class FakeAudioContext {
     buffer.rightData = new Float32Array(length);
     return buffer;
   }
-  async close() { this.closed = true; }
+  async close() {
+    this.closed = true;
+    if (pendingClose) {
+      let resolve!: () => void;
+      let reject!: (reason: Error) => void;
+      const promise = new Promise<void>((ok, fail) => { resolve = ok; reject = fail; });
+      pendingCloses.push({ promise, resolve, reject });
+      return promise;
+    }
+  }
 }
 class FakeOffline {
   destination = {};
@@ -160,6 +184,11 @@ beforeEach(() => {
   offlineConstructionFailure = false;
   renderStarts = 0;
   pendingRenders = [];
+  pendingDecode = undefined;
+  pendingDecodes = [];
+  pendingReads = [];
+  pendingClose = false;
+  pendingCloses = [];
   assetLevel = 0.01;
   assetRightLevel = 0.01;
   assetChannels = 1;
@@ -176,11 +205,18 @@ beforeEach(() => {
   vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(1) })));
 });
 afterEach(async () => {
-  // A cancelled wait does not cancel the physical render: settle the fake so
-  // its module-level reservation never leaks into the next test.
+  // A cancelled wait does not cancel physical work: settle every fake so its
+  // module-level tracker and render reservation never leak into the next test.
+  pendingRender = false;
+  pendingDecode = undefined;
+  pendingClose = false;
   pendingRenders.forEach((render) => render.resolve());
-  await Promise.allSettled(pendingRenders.map((render) => render.promise));
-  await Promise.resolve();
+  pendingDecodes.forEach((decode) => decode.resolve());
+  pendingReads.forEach((read) => read.resolve());
+  pendingCloses.forEach((close) => close.resolve());
+  await Promise.allSettled([...pendingRenders, ...pendingDecodes, ...pendingReads, ...pendingCloses].map((work) => work.promise));
+  await waitForSoundscapeIdle();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
@@ -435,6 +471,126 @@ describe('mixSoundscape', () => {
     expect(decoderInstances[0].closed).toBe(true);
     expect(offlineInstances).toHaveLength(0);
     expect(progress.mock.calls.map(([message]) => message)).not.toContain('오디오 믹싱이 완료되었습니다.');
+    // A network fetch itself does not hold the physical-memory tracker open.
+    await waitForSoundscapeIdle();
+    expect(hasPendingSoundscapeWork()).toBe(false);
+  });
+
+  it.each(['voice', 'asset'] as const)('waits for the physical %s decode after cancellation', async (kind) => {
+    pendingDecode = kind;
+    const controller = new AbortController();
+    const mixing = mixSoundscape(voice(), [], options, undefined, controller.signal);
+    await vi.waitFor(() => expect(pendingDecodes).toHaveLength(1));
+    controller.abort();
+    await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });
+
+    let idle = false;
+    const waiting = waitForSoundscapeIdle().then(() => { idle = true; });
+    await Promise.resolve();
+    expect(idle).toBe(false);
+    expect(hasPendingSoundscapeWork()).toBe(true);
+    // A rejected decoder must release the tracker just as a resolved one does.
+    if (kind === 'voice') pendingDecodes[0].reject(new Error('late decode failure'));
+    else pendingDecodes[0].resolve();
+    await waiting;
+    expect(idle).toBe(true);
+    expect(hasPendingSoundscapeWork()).toBe(false);
+  });
+
+  it('also waits for decoder close after a cancelled decode, including a late close failure', async () => {
+    pendingDecode = 'voice';
+    pendingClose = true;
+    const controller = new AbortController();
+    const mixing = mixSoundscape(voice(), [], options, undefined, controller.signal);
+    await vi.waitFor(() => expect(pendingDecodes).toHaveLength(1));
+    controller.abort();
+    await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });
+    expect(pendingCloses).toHaveLength(1);
+    let idle = false;
+    const waiting = waitForSoundscapeIdle().then(() => { idle = true; });
+    pendingDecodes[0].resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(idle).toBe(false);
+    pendingCloses[0].reject(new Error('late close failure'));
+    await waiting;
+    expect(idle).toBe(true);
+  });
+
+  it.each(['voice', 'asset'] as const)('waits for the physical %s byte read after cancellation', async (kind) => {
+    let resolve!: () => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<ArrayBuffer>((ok, fail) => {
+      resolve = () => ok(new ArrayBuffer(1));
+      reject = fail;
+    });
+    pendingReads.push({ promise, resolve, reject });
+    const read = vi.fn(() => promise);
+    const blob = voice();
+    if (kind === 'voice') vi.spyOn(blob, 'arrayBuffer').mockImplementation(read);
+    else vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, arrayBuffer: read })));
+    const controller = new AbortController();
+    const mixing = mixSoundscape(blob, [], options, undefined, controller.signal);
+    await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    controller.abort();
+    await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });
+
+    let idle = false;
+    const waiting = waitForSoundscapeIdle().then(() => { idle = true; });
+    await Promise.resolve();
+    expect(idle).toBe(false);
+    if (kind === 'voice') reject(new Error('late read failure'));
+    else resolve();
+    await waiting;
+    expect(idle).toBe(true);
+    expect(decoderInstances[0].decodeCount).toBe(kind === 'voice' ? 0 : 1);
+  });
+
+  it('does not start asset decoding when its body resolves immediately before cancellation', async () => {
+    let resolve!: () => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<ArrayBuffer>((ok, fail) => {
+      resolve = () => ok(new ArrayBuffer(1));
+      reject = fail;
+    });
+    pendingReads.push({ promise, resolve, reject });
+    const read = vi.fn(() => promise);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, arrayBuffer: read })));
+    const controller = new AbortController();
+    const mixing = mixSoundscape(voice(), [], options, undefined, controller.signal);
+    await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    resolve();
+    controller.abort();
+    await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });
+    await waitForSoundscapeIdle();
+    expect(decoderInstances[0].decodeCount).toBe(1);
+  });
+
+  it('does not report idle between byte reading and the next physical decode', async () => {
+    pendingDecode = 'voice';
+    let resolve!: () => void;
+    let reject!: (reason: Error) => void;
+    const promise = new Promise<ArrayBuffer>((ok, fail) => {
+      resolve = () => ok(new ArrayBuffer(1));
+      reject = fail;
+    });
+    pendingReads.push({ promise, resolve, reject });
+    const blob = voice();
+    const read = vi.spyOn(blob, 'arrayBuffer').mockReturnValue(promise);
+    const controller = new AbortController();
+    const mixing = mixSoundscape(blob, [], options, undefined, controller.signal);
+    await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(1));
+    let idle = false;
+    const waiting = waitForSoundscapeIdle().then(() => { idle = true; });
+    resolve();
+    await vi.waitFor(() => expect(pendingDecodes).toHaveLength(1));
+    expect(idle).toBe(false);
+    controller.abort();
+    await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });
+    expect(idle).toBe(false);
+    pendingDecodes[0].resolve();
+    await waiting;
+    expect(idle).toBe(true);
   });
 
   it('returns cancellation immediately even if offline rendering cannot be stopped', async () => {
@@ -447,6 +603,69 @@ describe('mixSoundscape', () => {
     await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
     expect(decoderInstances[0].closed).toBe(true);
     expect(progress.mock.calls.map(([message]) => message)).not.toContain('오디오 믹싱이 완료되었습니다.');
+    let idle = false;
+    const waiting = waitForSoundscapeIdle().then(() => { idle = true; });
+    await Promise.resolve();
+    expect(idle).toBe(false);
+    pendingRenders[0].resolve();
+    await waiting;
+    expect(idle).toBe(true);
+  });
+
+  it('keeps all idle waiters blocked until concurrent cancelled physical operations settle', async () => {
+    pendingRender = true;
+    const renderController = new AbortController();
+    const rendering = mixSoundscape(voice(), [], { ...options, effects: false }, undefined, renderController.signal);
+    await vi.waitFor(() => expect(pendingRenders).toHaveLength(1));
+    renderController.abort();
+    await expect(rendering).rejects.toMatchObject({ name: 'AbortError' });
+
+    let firstIdle = false;
+    const firstWaiter = waitForSoundscapeIdle().then(() => { firstIdle = true; });
+    pendingDecode = 'voice';
+    const decodeController = new AbortController();
+    const decoding = mixSoundscape(voice(), [], options, undefined, decodeController.signal);
+    await vi.waitFor(() => expect(pendingDecodes).toHaveLength(1));
+    decodeController.abort();
+    await expect(decoding).rejects.toMatchObject({ name: 'AbortError' });
+    let secondIdle = false;
+    const secondWaiter = waitForSoundscapeIdle().then(() => { secondIdle = true; });
+
+    pendingRenders[0].reject(new Error('late render failure'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(firstIdle).toBe(false);
+    expect(secondIdle).toBe(false);
+    pendingDecodes[0].resolve();
+    await Promise.all([firstWaiter, secondWaiter]);
+    expect(firstIdle).toBe(true);
+    expect(secondIdle).toBe(true);
+  });
+
+  it('rechecks idle if new work starts before a released waiter resumes', async () => {
+    pendingRender = true;
+    const firstController = new AbortController();
+    const first = mixSoundscape(voice(), [], { ...options, effects: false }, undefined, firstController.signal);
+    await vi.waitFor(() => expect(pendingRenders).toHaveLength(1));
+    firstController.abort();
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+
+    let idle = false;
+    const waiting = waitForSoundscapeIdle().then(() => { idle = true; });
+    const nextController = new AbortController();
+    let next!: Promise<unknown>;
+    void pendingRenders[0].promise.then(() => {
+      pendingDecode = 'voice';
+      next = mixSoundscape(voice(), [], options, undefined, nextController.signal);
+    });
+    pendingRenders[0].resolve();
+    await vi.waitFor(() => expect(pendingDecodes).toHaveLength(1));
+    expect(idle).toBe(false);
+    nextController.abort();
+    await expect(next).rejects.toMatchObject({ name: 'AbortError' });
+    pendingDecodes[0].resolve();
+    await waiting;
+    expect(idle).toBe(true);
   });
 
   it('does not create the next offline context until the cancelled physical render settles', async () => {
