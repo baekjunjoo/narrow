@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine, ArrowRight, AudioLines, Check, ChevronDown, CircleHelp,
   FileText, Headphones, Info, LoaderCircle, Pause, Play, Sparkles, Upload, Volume2,
@@ -6,12 +6,14 @@ import {
 import { TtsEngine } from "@/lib/tts-engine";
 import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type MixOptions } from "@/lib/soundscape";
 import BatchConverter from "@/components/BatchConverter";
+import QualityPanel from "@/components/QualityPanel";
 
 type Language = "ko" | "en";
 type Result = {
   url: string; blob: Blob; cues: Cue[]; duration: number; title: string; voice: string;
-  lang: Language; text: string; speed: number; mixUrl?: string;
+  lang: Language; text: string; speed: number; mixUrl?: string; mixBlob?: Blob;
   events?: { label: string; time: number }[]; warnings?: string[]; mixOptions?: MixOptions;
+  mixPending?: boolean; mixUnavailableReason?: string;
 };
 
 const voices = [
@@ -49,9 +51,11 @@ export default function Home() {
   const [busy, setBusy] = useState(initialSoundscapeWait.current);
   const [waitingForSoundscape, setWaitingForSoundscape] = useState(initialSoundscapeWait.current);
   const [batchBusy, setBatchBusy] = useState(false);
+  const [qualityBusy, setQualityBusy] = useState(false);
   const [status, setStatus] = useState(initialSoundscapeWait.current ? "이전 음향 처리가 마무리될 때까지 기다리고 있어요" : "");
   const [progress, setProgress] = useState<number | undefined>();
   const [error, setError] = useState("");
+  const [fileNotice, setFileNotice] = useState("");
   const [result, setResult] = useState<Result | null>(null);
   const [music, setMusic] = useState(true);
   const [effects, setEffects] = useState(true);
@@ -59,8 +63,13 @@ export default function Home() {
   const [musicVolume, setMusicVolume] = useState(0.5);
   const [effectsVolume, setEffectsVolume] = useState(0.5);
   const [playVersion, setPlayVersion] = useState<"mixed" | "voice">("voice");
+  // Async mix completions must use the latest user choice, not the render that started the mix.
+  const playVersionRef = useRef<"mixed" | "voice">("voice");
+  const fileReadRevision = useRef(0);
+  const mounted = useRef(true);
   const engine = useRef<TtsEngine | null>(null);
   const previewAudio = useRef<HTMLAudioElement | null>(null);
+  const resultAudio = useRef<HTMLAudioElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const generatedUrl = useRef<string | null>(null);
   const mixedUrl = useRef<string | null>(null);
@@ -70,6 +79,50 @@ export default function Home() {
   const resultIsOutdated = result && (result.text !== text.trim() || result.title !== (title.trim() || "나의 오디오북") || result.voice !== voice || result.lang !== lang || result.speed !== speed);
   const currentMix: MixOptions = { music, effects, musicVolume, effectsVolume, spatial };
   const settingsChanged = result?.mixOptions && JSON.stringify(result.mixOptions) !== JSON.stringify(currentMix);
+  const mixComponents = [
+    result?.mixOptions?.music && result.mixOptions.musicVolume > 0 ? "배경 음악" : "",
+    result?.mixOptions?.effects && result.mixOptions.effectsVolume > 0 && result.events?.length ? "장면 효과음" : "",
+  ].filter(Boolean);
+  // A settings-only render must not make the quality panel re-inspect the same blobs.
+  const qualitySources = useMemo<{ id: "voice" | "mixed"; label: string; blob: Blob }[]>(() => {
+    const sources: { id: "voice" | "mixed"; label: string; blob: Blob }[] = [];
+    if (result?.blob) sources.push({ id: "voice", label: "낭독만", blob: result.blob });
+    if (result?.mixUrl && result.mixBlob) sources.push({ id: "mixed", label: "음향 포함", blob: result.mixBlob });
+    return sources;
+  }, [result?.blob, result?.mixBlob, result?.mixUrl]);
+
+  const stopResultAudio = () => {
+    const audio = resultAudio.current;
+    if (!audio) return;
+    audio.pause();
+    // An unloaded player can reject a seek; replacing its source still starts at zero.
+    try { audio.currentTime = 0; } catch { /* no loaded timeline */ }
+  };
+
+  const updatePlayVersion = (next: "mixed" | "voice") => {
+    playVersionRef.current = next;
+    setPlayVersion(next);
+  };
+
+  const selectPlayVersion = (next: "mixed" | "voice") => {
+    if (next === playVersionRef.current || (next === "mixed" && !result?.mixUrl)) return;
+    stopResultAudio();
+    updatePlayVersion(next);
+  };
+
+  const stopPreview = () => {
+    previewAudio.current?.pause();
+    previewAudio.current = null;
+    setPlayingPreview(null);
+  };
+
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      fileReadRevision.current++;
+    };
+  }, []);
 
   useEffect(() => {
     const id = operation.current;
@@ -86,50 +139,61 @@ export default function Home() {
       mixAbort.current?.abort();
       engine.current?.dispose();
       previewAudio.current?.pause();
+      resultAudio.current?.pause();
       if (generatedUrl.current) URL.revokeObjectURL(generatedUrl.current);
       if (mixedUrl.current) URL.revokeObjectURL(mixedUrl.current);
     };
   }, []);
 
   const changeLanguage = (next: Language) => {
-    previewAudio.current?.pause();
-    setPlayingPreview(null);
+    stopPreview();
     setLang(next);
   };
 
   const playPreview = async (id: string) => {
     setError("");
     if (playingPreview === id) {
-      previewAudio.current?.pause();
-      setPlayingPreview(null);
+      stopPreview();
       return;
     }
-    previewAudio.current?.pause();
+    stopPreview();
+    resultAudio.current?.pause();
     const audio = new Audio(`/voice-previews/${lang}/${id}.mp3`);
     previewAudio.current = audio;
-    audio.onended = () => setPlayingPreview(null);
-    audio.onerror = () => { setPlayingPreview(null); setError("목소리 미리보기를 불러오지 못했습니다. 다시 시도해 주세요."); };
+    audio.onended = () => { if (previewAudio.current === audio) stopPreview(); };
+    audio.onerror = () => { if (previewAudio.current === audio) { stopPreview(); setError("목소리 미리보기를 불러오지 못했습니다. 다시 시도해 주세요."); } };
     try {
       await audio.play();
-      setPlayingPreview(id);
+      if (previewAudio.current === audio && !audio.paused) setPlayingPreview(id);
     } catch {
-      setPlayingPreview(null);
-      setError("목소리 미리보기를 재생하지 못했습니다. 브라우저의 소리 설정을 확인해 주세요.");
+      if (previewAudio.current === audio) {
+        stopPreview();
+        setError("목소리 미리보기를 재생하지 못했습니다. 브라우저의 소리 설정을 확인해 주세요.");
+      }
     }
   };
 
   const loadFile = async (file?: File) => {
     if (!file) return;
+    const revision = ++fileReadRevision.current;
+    setFileNotice("");
     if (!file.name.toLowerCase().endsWith(".txt")) {
       setError("지금은 UTF-8 텍스트(.txt) 파일만 불러올 수 있습니다.");
       return;
     }
+    const isCurrentRead = () => mounted.current && fileReadRevision.current === revision;
+    const announceDiscard = () => {
+      if (mounted.current) setFileNotice("원고나 작업이 변경되어 이전 파일 불러오기를 건너뛰었습니다.");
+    };
     try {
-      const content = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
+      const bytes = await file.arrayBuffer();
+      if (!isCurrentRead()) { announceDiscard(); return; }
+      const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       setText(content);
       setTitle(file.name.replace(/\.txt$/i, "") || "나의 오디오북");
       setError("");
     } catch {
+      if (!isCurrentRead()) { announceDiscard(); return; }
       setError("파일을 읽지 못했습니다. 텍스트를 UTF-8로 저장한 후 다시 불러와 주세요.");
     }
   };
@@ -137,15 +201,16 @@ export default function Home() {
   const generate = async () => {
     if (busy) return;
     if (batchBusy) { setError("일괄 변환 또는 ZIP 준비가 끝난 뒤 제작을 시작해 주세요."); return; }
+    if (qualityBusy) { setError("오디오 품질 검사가 끝난 뒤 제작을 시작해 주세요."); return; }
     if (!text.trim()) { setError("먼저 읽을 원고를 입력해 주세요."); return; }
     if (text.length > 10000) { setError("안정적인 제작을 위해 원고를 10,000자 이하로 나눠 입력해 주세요."); return; }
+    fileReadRevision.current++;
     const id = ++operation.current;
     setBusy(true);
     setError("");
     setProgress(undefined);
     setStatus("음성 제작을 준비하고 있어요.");
-    previewAudio.current?.pause();
-    setPlayingPreview(null);
+    stopPreview();
     try {
       if (!engine.current) engine.current = new TtsEngine();
       const output = await engine.current.generate({ text: text.trim(), lang, voice, speed }, (message, percent) => {
@@ -153,14 +218,22 @@ export default function Home() {
       });
       if (operation.current !== id) return;
       const url = URL.createObjectURL(output.blob);
+      stopResultAudio();
       if (generatedUrl.current) URL.revokeObjectURL(generatedUrl.current);
       if (mixedUrl.current) URL.revokeObjectURL(mixedUrl.current);
       mixedUrl.current = null;
       generatedUrl.current = url;
-      const draft: Result = { url, blob: output.blob, cues: output.cues, duration: output.duration, title: title.trim() || "나의 오디오북", voice, lang, text: text.trim(), speed };
+      const willMix = currentMix.music || currentMix.effects;
+      const draft: Result = {
+        url, blob: output.blob, cues: output.cues, duration: output.duration,
+        title: title.trim() || "나의 오디오북", voice, lang, text: text.trim(), speed,
+        mixPending: willMix,
+        mixUnavailableReason: willMix ? "음향을 처리하는 중이라 현재는 낭독만 사용할 수 있습니다." : "배경 음악과 효과음이 꺼져 있어 낭독만 만들었습니다.",
+        mixOptions: willMix ? undefined : currentMix,
+      };
       setResult(draft);
-      setPlayVersion("voice");
-      if (currentMix.music || currentMix.effects) {
+      updatePlayVersion("voice");
+      if (willMix) {
         setStatus("장면 단서를 찾고 배경음을 준비하고 있어요.");
         setProgress(undefined);
         try {
@@ -173,11 +246,14 @@ export default function Home() {
           const hasSound = (currentMix.music && currentMix.musicVolume > 0) || (currentMix.effects && currentMix.effectsVolume > 0 && mixed.events.length > 0);
           const mixUrl = hasSound ? URL.createObjectURL(mixed.blob) : undefined;
           mixedUrl.current = mixUrl ?? null;
-          setResult({ ...draft, mixUrl, events: mixed.events, warnings: mixed.warnings, mixOptions: currentMix });
-          setPlayVersion(hasSound ? "mixed" : "voice");
+          setResult({ ...draft, mixUrl, mixBlob: mixUrl ? mixed.blob : undefined, mixPending: false, mixUnavailableReason: mixUrl ? undefined : "추가된 배경 음악이나 효과음이 없어 낭독만 만들었습니다.", events: mixed.events, warnings: mixed.warnings, mixOptions: currentMix });
         } catch (mixError) {
           if (operation.current !== id) return;
+          setResult({ ...draft, mixPending: false, mixUnavailableReason: "음향 처리에 실패해 낭독만 사용할 수 있습니다. 음향 설정을 다시 적용해 보세요." });
           setError(`음향을 넣지 못했습니다. 낭독만 파일은 아래에서 다운로드할 수 있습니다. ${mixError instanceof Error ? mixError.message : "다시 시도해 주세요."}`);
+          setStatus("낭독이 완료되었지만 음향을 적용하지 못했습니다.");
+          setProgress(100);
+          return;
         }
       }
       setStatus("음성 제작이 완료되었어요.");
@@ -205,6 +281,9 @@ export default function Home() {
     mixAbort.current = null;
     engine.current?.dispose();
     engine.current = null;
+    setResult(previous => previous?.mixPending
+      ? { ...previous, mixPending: false, mixUnavailableReason: "음향 처리를 취소해 낭독만 사용할 수 있습니다. 음향 설정을 다시 적용할 수 있어요." }
+      : previous);
     setProgress(undefined);
     setError("");
     if (!hasPendingSoundscapeWork()) {
@@ -224,17 +303,21 @@ export default function Home() {
   };
 
   const remix = async () => {
-    if (!result || busy || batchBusy) return;
+    if (!result || busy || batchBusy || qualityBusy) return;
     const id = ++operation.current;
     setError("");
     if (!currentMix.music && !currentMix.effects) {
+      if (playVersionRef.current === "mixed") {
+        stopResultAudio();
+        updatePlayVersion("voice");
+      }
       if (mixedUrl.current) URL.revokeObjectURL(mixedUrl.current);
       mixedUrl.current = null;
-      setResult({ ...result, mixUrl: undefined, events: [], warnings: [], mixOptions: currentMix });
-      setPlayVersion("voice");
+      setResult({ ...result, mixUrl: undefined, mixBlob: undefined, mixPending: false, mixUnavailableReason: "배경 음악과 효과음이 꺼져 있어 낭독만 사용할 수 있습니다.", events: [], warnings: [], mixOptions: currentMix });
       return;
     }
     setBusy(true);
+    if (!result.mixUrl) setResult({ ...result, mixPending: true, mixUnavailableReason: "음향을 처리하는 중이라 현재는 낭독만 사용할 수 있습니다." });
     setProgress(undefined);
     setStatus("기존 낭독에 음향을 다시 적용하고 있어요.");
     try {
@@ -246,14 +329,18 @@ export default function Home() {
       if (operation.current !== id) return;
       const hasSound = (currentMix.music && currentMix.musicVolume > 0) || (currentMix.effects && currentMix.effectsVolume > 0 && mixed.events.length > 0);
       const mixUrl = hasSound ? URL.createObjectURL(mixed.blob) : undefined;
+      // Only the old mixed file is being replaced; never interrupt the voice file.
+      const audio = resultAudio.current;
+      if (playVersionRef.current === "mixed" && mixedUrl.current && audio?.src === mixedUrl.current && !audio.paused) stopResultAudio();
+      if (!mixUrl && playVersionRef.current === "mixed") updatePlayVersion("voice");
       if (mixedUrl.current) URL.revokeObjectURL(mixedUrl.current);
       mixedUrl.current = mixUrl ?? null;
-      setResult({ ...result, mixUrl, events: mixed.events, warnings: mixed.warnings, mixOptions: currentMix });
-      setPlayVersion(hasSound ? "mixed" : "voice");
+      setResult({ ...result, mixUrl, mixBlob: mixUrl ? mixed.blob : undefined, mixPending: false, mixUnavailableReason: mixUrl ? undefined : "추가된 배경 음악이나 효과음이 없어 낭독만 사용할 수 있습니다.", events: mixed.events, warnings: mixed.warnings, mixOptions: currentMix });
       setStatus("음향을 다시 적용했어요.");
     } catch (mixError) {
       if (operation.current !== id) return;
-      setError(`음향을 적용하지 못했습니다. 기존 낭독은 그대로 남아 있습니다. ${mixError instanceof Error ? mixError.message : "다시 시도해 주세요."}`);
+      if (!result.mixUrl) setResult({ ...result, mixPending: false, mixUnavailableReason: "음향 처리에 실패해 낭독만 사용할 수 있습니다. 음향 설정을 다시 적용해 보세요." });
+      setError(`음향을 적용하지 못했습니다. ${result.mixUrl ? "이전 음향 포함 버전과 낭독만 버전은 그대로 남아 있습니다." : "기존 낭독은 그대로 남아 있습니다."} ${mixError instanceof Error ? mixError.message : "다시 시도해 주세요."}`);
     } finally {
       if (operation.current === id) { mixAbort.current = null; setBusy(false); }
     }
@@ -297,10 +384,11 @@ export default function Home() {
               <section className="panel manuscript-panel">
                 <div className="panel-header"><div><div className="section-kicker">YOUR MANUSCRIPT</div><h2><span className="section-number">01</span> 원고 입력</h2><p>텍스트를 직접 입력하거나 파일을 불러오세요.</p></div><div className="header-icon"><FileText size={19} /></div></div>
                 <label className="field-label" htmlFor="book-title">제목 <span>파일명으로 사용돼요</span></label>
-                <input id="book-title" name="secret_book_title" className="title-input" value={title} onChange={event => setTitle(event.target.value)} maxLength={100} disabled={busy} />
-                <div className="manuscript-label"><label className="field-label" htmlFor="manuscript">원고 <span>최대 10,000자</span></label><div className="text-actions"><button type="button" onClick={() => setText(example[lang])} disabled={busy}>예시 원고 넣기</button><span /> <button type="button" onClick={() => fileRef.current?.click()} disabled={busy}><Upload size={13} /> TXT 불러오기</button></div></div>
+                <input id="book-title" name="secret_book_title" className="title-input" value={title} onChange={event => { fileReadRevision.current++; setTitle(event.target.value); }} maxLength={100} disabled={busy} />
+                <div className="manuscript-label"><label className="field-label" htmlFor="manuscript">원고 <span>최대 10,000자</span></label><div className="text-actions"><button type="button" onClick={() => { fileReadRevision.current++; setText(example[lang]); }} disabled={busy}>예시 원고 넣기</button><span /> <button type="button" onClick={() => fileRef.current?.click()} disabled={busy}><Upload size={13} /> TXT 불러오기</button></div></div>
                 <input ref={fileRef} type="file" accept=".txt,text/plain" hidden onChange={event => { void loadFile(event.target.files?.[0]); event.target.value = ""; }} />
-                <div className="editor-wrap"><textarea id="manuscript" name="secret_manuscript" value={text} onChange={event => setText(event.target.value)} placeholder="이곳에 들려주고 싶은 이야기를 입력해 주세요.\n\n문장과 문단을 구분하면 더 자연스러운 낭독에 도움이 됩니다." disabled={busy} /><div className="editor-bottom"><span>TXT 파일 또는 직접 입력</span><strong className={text.length > 10000 ? "over-limit" : ""}>{text.length.toLocaleString()} <em>/ 10,000자</em></strong></div></div>
+                <div className="editor-wrap"><textarea id="manuscript" name="secret_manuscript" value={text} onChange={event => { fileReadRevision.current++; setText(event.target.value); }} placeholder="이곳에 들려주고 싶은 이야기를 입력해 주세요.\n\n문장과 문단을 구분하면 더 자연스러운 낭독에 도움이 됩니다." disabled={busy} /><div className="editor-bottom"><span>TXT 파일 또는 직접 입력</span><strong className={text.length > 10000 ? "over-limit" : ""}>{text.length.toLocaleString()} <em>/ 10,000자</em></strong></div></div>
+                {fileNotice && <p className="editor-note" role="status">{fileNotice}</p>}
                 <div className="editor-note"><Info size={15} /><span>긴 책은 장이나 단락별로 나눠 제작하면 검수와 수정이 쉬워요.</span></div>
               </section>
 
@@ -337,8 +425,9 @@ export default function Home() {
                   <p>입체 모드는 개인 맞춤이 아닌 2채널 헤드폰용 시제품입니다. 방향·거리감은 창작적인 연출이며 돌비 애트모스나 영화관 다채널 믹스가 아닙니다.</p>
                   <p>음향 포함 작업은 최대 10분까지 지원합니다. 시험용 AI 생성 음향이므로 상업 배포 전 이용 권리를 확인해 주세요.</p>
                 </fieldset>
-                <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy || batchBusy}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
+                <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy || batchBusy || qualityBusy}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
                 {batchBusy && <p className="batch-busy-note" role="status">일괄 변환 또는 ZIP 준비가 진행 중입니다. 끝난 뒤 오디오를 제작할 수 있어요.</p>}
+                {qualityBusy && <p className="batch-busy-note" role="status">오디오 품질 검사 중입니다. 검사가 끝난 뒤 오디오 제작이나 음향 재적용, 일괄 변환을 시작할 수 있어요.</p>}
                 {busy && <div className="progress-box" role="status"><div className="progress-head"><span>{status}</span>{typeof progress === "number" && <strong>{Math.round(progress)}%</strong>}</div><div className="progress-track"><span style={{ width: `${typeof progress === "number" ? Math.max(3, Math.min(100, progress)) : 8}%` }} /></div><p>{waitingForSoundscape ? "브라우저에서 이미 시작한 음향 작업은 즉시 중단할 수 없어 오래 걸릴 수 있습니다. 작업이 끝날 때까지 새 오디오 작업을 시작할 수 없어요." : "긴 원고는 시간이 걸릴 수 있어요. 제작 중 이 페이지를 열어 두세요."}</p><button type="button" className="cancel-btn" onClick={cancel} disabled={waitingForSoundscape}>{waitingForSoundscape ? "처리 종료 대기 중" : "제작 취소"}</button></div>}
                 {!busy && status.startsWith("제작을 취소") && <div className="cancel-notice" role="status">{status}</div>}
                 {error && <div role="alert" className="error-box"><Info size={16} /> {error}</div>}
@@ -349,20 +438,41 @@ export default function Home() {
                 <div className="output-heading"><div><div className="section-kicker">YOUR AUDIO</div><h2>완성된 오디오</h2></div><span className="output-icon"><Headphones size={18} /></span></div>
                 {result ? <div className="audio-result"><div className="result-file"><span className="result-file-icon"><AudioLines size={20} /></span><div><strong>{result.title}</strong><small>{result.lang === "ko" ? "한국어" : "English"} · {result.voice} · {formatTime(result.duration)}</small></div><span className="ready-tag">{resultIsOutdated ? "이전 결과" : "완료"}</span></div>
                   {resultIsOutdated && <p className="stale-notice">현재 원고나 설정을 바꾸기 전에 만든 오디오입니다.</p>}
-                  {result.mixUrl && <div className="version-toggle" role="group" aria-label="오디오 미리듣기 버전"><button type="button" aria-pressed={playVersion === "mixed"} className={playVersion === "mixed" ? "active" : ""} onClick={() => setPlayVersion("mixed")}>음향 포함</button><button type="button" aria-pressed={playVersion === "voice"} className={playVersion === "voice" ? "active" : ""} onClick={() => setPlayVersion("voice")}>낭독만</button></div>}
-                  <audio key={playVersion} controls src={playVersion === "mixed" && result.mixUrl ? result.mixUrl : result.url} preload="metadata" aria-label={playVersion === "mixed" && result.mixUrl ? "음향 포함 오디오 미리 듣기" : "낭독만 오디오 미리 듣기"} />
-                  {result.mixUrl && <a href={result.mixUrl} download={`${safeName}_음향포함.mp3`} className="download-btn"><ArrowDownToLine size={16} /> 음향 포함 MP3 다운로드</a>}
-                  <a href={result.url} download={`${safeName}_낭독만.mp3`} className="download-btn voice-download"><ArrowDownToLine size={16} /> 낭독만 MP3 다운로드</a>
+                  {result.mixUrl ? <fieldset className="version-picker" aria-describedby="version-help">
+                    <legend>들을 버전 선택</legend>
+                    <p id="version-help">버전을 바꾸면 재생이 멈추고 처음부터 다시 재생됩니다.</p>
+                    <label className={`version-option ${playVersion === "voice" ? "selected" : ""}`}>
+                      <input type="radio" name="play-version" value="voice" checked={playVersion === "voice"} onChange={() => selectPlayVersion("voice")} />
+                      <span className="version-copy"><strong>낭독만</strong><small>배경 음악과 효과음 없이 목소리만 들려요.</small></span>
+                      {playVersion === "voice" && <span className="version-selected" aria-hidden="true">선택됨</span>}
+                    </label>
+                    <label className={`version-option ${playVersion === "mixed" ? "selected" : ""}`}>
+                      <input type="radio" name="play-version" value="mixed" checked={playVersion === "mixed"} onChange={() => selectPlayVersion("mixed")} />
+                      <span className="version-copy"><strong>음향 포함</strong><small>낭독 + {mixComponents.join(" + ") || "배경 음악 또는 장면 효과음"}</small></span>
+                      {playVersion === "mixed" && <span className="version-selected" aria-hidden="true">선택됨</span>}
+                    </label>
+                  </fieldset> : <div className="version-single">
+                    <strong>사용 가능한 버전 · 낭독만</strong>
+                    <p>배경 음악과 효과음 없이 목소리만 들려요.</p>
+                    {result.mixUnavailableReason && <p>{result.mixUnavailableReason}</p>}
+                  </div>}
+                  <audio ref={resultAudio} key={playVersion === "mixed" && result.mixUrl ? result.mixUrl : result.url} controls src={playVersion === "mixed" && result.mixUrl ? result.mixUrl : result.url} preload="metadata" aria-label={playVersion === "mixed" && result.mixUrl ? "음향 포함 오디오 재생" : "낭독만 오디오 재생"} onPlay={stopPreview} />
+                  <div className="download-heading">{result.mixUrl ? "두 버전 개별 다운로드" : "낭독만 다운로드"}</div>
+                  {result.mixUrl && <p className="download-hint">청취 선택과 관계없이 각 파일을 따로 저장할 수 있어요.</p>}
+                  <a href={result.url} download={`${safeName}_낭독만.mp3`} className="download-btn"><ArrowDownToLine size={16} aria-hidden="true" /> 낭독만 MP3 다운로드</a>
+                  {result.mixUrl && <a href={result.mixUrl} download={`${safeName}_음향포함.mp3`} className="download-btn voice-download"><ArrowDownToLine size={16} aria-hidden="true" /> 음향 포함 MP3 다운로드</a>}
                   {result.events && result.events.length > 0 && <div className="cue-summary"><strong>자동 배치된 효과음</strong><p>{result.events.map(event => `${formatTime(event.time)} ${event.label}`).join(" · ")}</p></div>}
                   {result.warnings?.map((warning, index) => <p className="sound-warning" key={`${index}-${warning}`}>{warning}</p>)}
                   {settingsChanged && <p className="sound-warning">음향 설정을 변경했습니다. 아래 버튼으로 기존 낭독에 다시 적용해 주세요.</p>}
-                  {(settingsChanged || (!result.mixOptions && (music || effects))) && <button type="button" className="remix-btn" onClick={() => void remix()} disabled={busy || batchBusy}>완성된 낭독에 음향 설정 다시 적용</button>}
-                  <p>음향 파일은 합쳐진 MP3라서 재생 중 소리별 조절은 되지 않습니다. 새로 제작하면 기존 결과가 교체되므로 필요한 파일은 먼저 다운로드해 주세요. 새로고침하면 화면의 결과는 사라집니다.</p></div> : <div className="output-empty"><div className="empty-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><strong>아직 만들어진 오디오가 없어요</strong><p>원고와 목소리를 선택하고<br />오디오를 만들어 보세요.</p></div>}
+                  {(settingsChanged || (!result.mixOptions && (music || effects))) && <button type="button" className="remix-btn" onClick={() => void remix()} disabled={busy || batchBusy || qualityBusy}>완성된 낭독에 음향 설정 다시 적용</button>}
+                  <p className="result-disclaimer">음향 파일은 합쳐진 MP3라서 재생 중 소리별 조절은 되지 않습니다. 새로 제작하면 기존 결과가 교체되므로 필요한 파일은 먼저 다운로드해 주세요. 새로고침하면 화면의 결과는 사라집니다.</p></div> : <div className="output-empty"><div className="empty-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><strong>아직 만들어진 오디오가 없어요</strong><p>원고와 목소리를 선택하고<br />오디오를 만들어 보세요.</p></div>}
+                {result && <a className="quality-shortcut" href="#quality-panel">완성된 오디오 자동 점검 결과 보기 <ArrowRight size={14} aria-hidden="true" /></a>}
               </section>
               <div className="model-note"><CircleHelp size={15} /><p>처음 제작할 때 공개 모델 약 380MB를 다운로드합니다. 컴퓨터 성능과 인터넷 속도에 따라 시간이 걸릴 수 있어요.</p></div>
             </aside>
           </div>
-          <BatchConverter otherBusy={busy} onBusyChange={setBatchBusy} />
+          <QualityPanel sources={qualitySources} otherBusy={busy || batchBusy} onBusyChange={setQualityBusy} />
+          <BatchConverter otherBusy={busy || qualityBusy} onBusyChange={setBatchBusy} />
           <footer><span>© 텍타일오디오 · AI 생성 음성</span><span>Supertonic 3 · <a href="/licenses/index.html" target="_blank" rel="noreferrer">오픈소스 및 이용 조건</a></span></footer>
         </div>
       </main>
