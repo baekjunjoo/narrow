@@ -173,7 +173,7 @@ class FakeOffline {
 }
 
 const options: MixOptions = { music: false, effects: true, musicVolume: 1, effectsVolume: 1 };
-const effectUrls = ['rain', 'forest', 'ocean', 'footsteps', 'door', 'page'].map((name) => `/soundscape/${name}.mp3`);
+const effectUrls = ['rain', 'forest', 'ocean', 'footsteps', 'door', 'page'].map((name) => `/soundscape/tinyaudio-v1/${name}.mp3`);
 const voice = () => new Blob([new Uint8Array([1])], { type: 'audio/mpeg' });
 const cue = (text: string, start = 0, duration = 4): Cue => ({ text, start, duration });
 
@@ -468,7 +468,7 @@ describe('mixSoundscape', () => {
 
   it('reports missing or invalid files rather than silently omitting requested sounds', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 404 })));
-    await expect(mixSoundscape(voice(), [cue('rain')], options)).rejects.toThrow('/soundscape/rain.mp3');
+    await expect(mixSoundscape(voice(), [cue('rain')], options)).rejects.toThrow('/soundscape/tinyaudio-v1/rain.mp3');
     expect(decoderInstances[0].closed).toBe(true);
   });
 

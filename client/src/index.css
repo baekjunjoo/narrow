@@ -1543,3 +1543,10 @@ input:disabled, select:disabled, textarea:disabled { opacity: .8; cursor: not-al
 }
 .preset-option:focus-within { outline: 3px solid #111; outline-offset: 3px; }
 .preset-hint, .preset-fieldset p { margin: 10px 0 0; color: #333; font-size: 11px; line-height: 1.7; }
+
+/* TinyAudio 실험 음향의 개별 청취 검수 */
+.effect-preview { margin-top: 12px; }
+.effect-preview summary { cursor: pointer; font-weight: 600; }
+.effect-preview-item { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+.effect-preview-item span { min-width: 3.5em; }
+.effect-preview-item audio { width: min(100%, 260px); height: 36px; }

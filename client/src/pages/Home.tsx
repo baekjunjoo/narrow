@@ -447,7 +447,19 @@ export default function Home() {
                   <label className="sound-toggle"><input type="checkbox" checked={spatial} onChange={event => setSpatial(event.target.checked)} disabled={busy || (!music && !effects)} /><span><strong>입체 음향 · 이어폰 권장</strong><small>효과음에 창작적인 방향과 거리감을 더해요</small></span></label>
                   <p id="sound-help">비, 숲, 바다, 발소리, 문, 책장 단서를 찾고 낭독의 쉼을 참고해 배치합니다. 단어별 정확한 정렬은 아니므로 문맥과 타이밍을 꼭 확인해 주세요.</p>
                   <p>입체 모드는 개인 맞춤이 아닌 2채널 헤드폰용 시제품입니다. 방향·거리감은 창작적인 연출이며 돌비 애트모스나 영화관 다채널 믹스가 아닙니다.</p>
-                  <p>음향 포함 작업은 최대 10분까지 지원합니다. 시험용 AI 생성 음향이므로 상업 배포 전 이용 권리를 확인해 주세요.</p>
+                  <p>효과음은 TinyAudio로 미리 만든 시험용 AI 음향으로 실제 녹음이 아닙니다. 실시간 생성은 지원하지 않으며, 특히 발소리·문·책장·파도는 실제와 다르거나 작게 들릴 수 있으니 직접 확인해 주세요.</p>
+                  <details className="effect-preview">
+                    <summary>시범 효과음 미리 듣기</summary>
+                    <p>소리의 적합성은 사람의 청취 검수가 필요합니다. 원치 않으면 장면 효과음을 끌 수 있습니다.</p>
+                    {[
+                      ["rain", "비"], ["forest", "숲"], ["ocean", "파도"],
+                      ["footsteps", "발소리"], ["door", "문"], ["page", "책장"],
+                    ].map(([name, label]) => <div className="effect-preview-item" key={name}>
+                      <span>{label}</span>
+                      <audio controls preload="none" src={`${import.meta.env.BASE_URL}soundscape/tinyaudio-v1/${name}.mp3`} aria-label={`${label} 시범 효과음 미리듣기`} />
+                    </div>)}
+                  </details>
+                  <p>음향 포함 작업은 최대 10분까지 지원합니다. 배경 음악은 별도 시험용 AI 자산이므로 상업 배포 전 이용 권리를 확인해 주세요.</p>
                 </fieldset>
                 <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy || batchBusy || qualityBusy}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
                 {batchBusy && <p className="batch-busy-note" role="status">일괄 변환 또는 ZIP 준비가 진행 중입니다. 끝난 뒤 오디오를 제작할 수 있어요.</p>}
@@ -493,7 +505,7 @@ export default function Home() {
                   <p className="result-disclaimer">음향 파일은 합쳐진 MP3라서 재생 중 소리별 조절은 되지 않습니다. 새로 제작하면 기존 결과가 교체되므로 필요한 파일은 먼저 다운로드해 주세요. 새로고침하면 화면의 결과는 사라집니다.</p></div> : <div className="output-empty"><div className="empty-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><strong>아직 만들어진 오디오가 없어요</strong><p>원고와 목소리를 선택하고<br />오디오를 만들어 보세요.</p></div>}
                 {result && <a className="quality-shortcut" href="#quality-panel">완성된 오디오 자동 점검 결과 보기 <ArrowRight size={14} aria-hidden="true" /></a>}
               </section>
-              <div className="model-note"><CircleHelp size={15} /><p>처음 제작할 때 공개 모델 약 380MB를 다운로드합니다. 컴퓨터 성능과 인터넷 속도에 따라 시간이 걸릴 수 있어요.</p></div>
+              <div className="model-note"><CircleHelp size={15} /><p>처음 제작할 때 낭독 모델 약 380MB를 다운로드합니다. TinyAudio 효과음은 미리 제작된 파일을 사용하며 별도 모델 다운로드가 필요하지 않습니다.</p></div>
             </aside>
           </div>
           <QualityPanel sources={qualitySources} otherBusy={busy || batchBusy} onBusyChange={setQualityBusy} />

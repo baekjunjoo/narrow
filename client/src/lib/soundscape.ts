@@ -215,7 +215,9 @@ async function acquireOfflineSlot(report: (message: string) => void, signal?: Ab
 }
 
 async function loadAsset(context: AudioContext, filename: string, signal?: AbortSignal): Promise<AudioBuffer> {
-  const url = `${ASSET_ROOT}/${filename}.mp3`;
+  const url = filename === 'music-calm'
+    ? `${ASSET_ROOT}/${filename}.mp3`
+    : `${ASSET_ROOT}/tinyaudio-v1/${filename}.mp3`;
   let bytes: ArrayBuffer;
   try {
     throwIfAborted(signal);
