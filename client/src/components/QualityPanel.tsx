@@ -9,6 +9,7 @@ import {
 } from "react";
 import { AudioLines, Info, LoaderCircle, Trash2 } from "lucide-react";
 import { AudioQualityAnalyzer, type QualityReport } from "@/lib/audio-quality";
+import { createQualityCsv, qualityReportFilename } from "@/lib/quality-report";
 import "./QualityPanel.css";
 
 type QualitySource = { id: "voice" | "mixed"; label: string; blob: Blob };
@@ -207,8 +208,12 @@ export default function QualityPanel({
   const [items, setItems] = useState<QualityItem[]>([]);
   const [notice, setNotice] = useState("");
   const [events, setEvents] = useState<{ id: number; text: string }[]>([]);
+  const [downloads, setDownloads] = useState<string[]>([]);
   const itemsRef = useRef<QualityItem[]>([]);
   const activeRef = useRef<ActiveJob | null>(null);
+  const pendingDownloadsRef = useRef(new Set<string>());
+  const sourcesRef = useRef(sources);
+  sourcesRef.current = sources;
   const generationRef = useRef(0);
   const nextFileRef = useRef(1);
   const nextEventRef = useRef(1);
@@ -552,6 +557,66 @@ export default function QualityPanel({
     announce(message);
   };
 
+  const downloadReport = async (item: QualityItem, format: "csv" | "pdf") => {
+    const downloadKey = `${item.key}:${format}`;
+    if (pendingDownloadsRef.current.has(downloadKey)) return;
+    const isCurrent = () => mountedRef.current && itemsRef.current.some(entry =>
+      entry.key === item.key && entry.blob === item.blob && entry.state === "done" &&
+      entry.result === item.result && !!entry.result &&
+      (!entry.sourceId || sourcesRef.current.some(source => source.id === entry.sourceId && source.blob === entry.blob))
+    );
+    if (!isCurrent() || item.state !== "done" || !item.result) {
+      const message = "완료된 검사 결과만 내려받을 수 있습니다.";
+      showNotice(message);
+      announce(message);
+      return;
+    }
+    pendingDownloadsRef.current.add(downloadKey);
+    setDownloads(current => [...current, downloadKey]);
+    const input = { state: "done" as const, label: item.label, report: item.result };
+    announce(`${item.label} ${format.toUpperCase()} 보고서 생성을 시작합니다.`);
+    try {
+      let blob: Blob;
+      if (format === "pdf") {
+        const { createQualityPdf, loadReportFont } = await import("@/lib/quality-report-pdf");
+        blob = await createQualityPdf(input, await loadReportFont());
+      } else {
+        blob = createQualityCsv(input);
+      }
+      if (!isCurrent()) {
+        const message = "검사 결과가 변경되어 이전 보고서 다운로드를 취소했습니다.";
+        showNotice(message);
+        announce(message);
+        return;
+      }
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement("a");
+        anchor.href = url;
+        anchor.download = qualityReportFilename(item.label, format);
+        anchor.hidden = true;
+        document.body.appendChild(anchor);
+        try { anchor.click(); } finally { anchor.remove(); }
+      } catch (error) {
+        URL.revokeObjectURL(url);
+        throw error;
+      }
+      // Retain the URL long enough for browsers to start reading the Blob.
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      const message = `${item.label} ${format.toUpperCase()} 보고서 다운로드를 시작했습니다. 브라우저의 저장 상태를 확인해 주세요.`;
+      showNotice(message);
+      announce(message);
+    } catch (error) {
+      const detail = error instanceof Error && error.message ? error.message : "브라우저 또는 저장 공간을 확인해 주세요.";
+      const message = `${item.label} ${format.toUpperCase()} 보고서를 만들거나 다운로드하지 못했습니다. ${detail}`;
+      showNotice(message);
+      announce(message);
+    } finally {
+      pendingDownloadsRef.current.delete(downloadKey);
+      if (mountedRef.current) setDownloads(current => current.filter(key => key !== downloadKey));
+    }
+  };
+
   // During a source prop change, hide the old result even before reconciliation runs.
   const visibleItems = items.filter(
     item =>
@@ -605,6 +670,12 @@ export default function QualityPanel({
             <li>
               탭을 닫거나 새로고침하면 목록과 보고서가 사라집니다. 기기와
               브라우저의 메모리 한계로 검사에 실패할 수 있습니다.
+            </li>
+            <li id={`${inputId}-report-help`}>
+              보고서는 기기에서 생성하며 검사 결과를 서버로 보내지 않습니다.
+              PDF 태그와 읽기 순서는 검증하지 않아 PDF 접근성을 보장하지
+              않습니다. CSV를 대안으로 이용해 주세요. CSV의 수식 실행 방지를
+              위해 일부 값 앞에 작은따옴표가 추가될 수 있습니다.
             </li>
           </ul>
         </div>
@@ -726,8 +797,22 @@ export default function QualityPanel({
                   {item.message}
                 </p>
               )}
-              {item.result && <ResultDetails report={item.result} />}
+              {item.state === "done" && item.result && <ResultDetails report={item.result} />}
               <div className="quality-item-actions">
+                {item.state === "done" && item.result && (["csv", "pdf"] as const).map(format => (
+                  <FocusRestoringButton
+                    key={format}
+                    type="button"
+                    className="quality-secondary"
+                    aria-label={`${item.label} ${format.toUpperCase()} 품질 보고서 다운로드`}
+                    aria-describedby={`${inputId}-report-help`}
+                    aria-disabled={downloads.includes(`${item.key}:${format}`)}
+                    onClick={() => { void downloadReport(item, format); }}
+                    onFocusedRemoval={restoreFocusAfterRemoval}
+                  >
+                    {format.toUpperCase()} 다운로드
+                  </FocusRestoringButton>
+                ))}
                 {(item.state === "failed" || item.state === "cancelled") && (
                   <FocusRestoringButton
                     type="button"
@@ -763,6 +848,10 @@ export default function QualityPanel({
       <p className="quality-privacy">
         <strong>내 기기에서 점검</strong> · 원본을 변경하거나 서버에 전송하지
         않습니다. 검사 결과는 청취 검수를 대신하지 않습니다.
+        {" "}<a href={`${import.meta.env.BASE_URL}licenses/QUALITY_REPORT_NOTICE.md`}>보고서 글꼴과 소프트웨어 이용 조건</a>
+      </p>
+      <p className="quality-privacy">
+        <a href={`${import.meta.env.BASE_URL}accessibility/screen-reader-tests.zip`} download>VoiceOver·TalkBack 점검 스크립트 다운로드 (ZIP)</a> · 실제 기기에서 별도로 실행하고 발화와 탐색을 직접 확인해야 합니다.
       </p>
     </section>
   );

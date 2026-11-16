@@ -9,12 +9,19 @@ import BatchConverter from "@/components/BatchConverter";
 import QualityPanel from "@/components/QualityPanel";
 
 type Language = "ko" | "en";
+type PresetId = "narration" | "balanced" | "immersive";
 type Result = {
   url: string; blob: Blob; cues: Cue[]; duration: number; title: string; voice: string;
   lang: Language; text: string; speed: number; mixUrl?: string; mixBlob?: Blob;
   events?: { label: string; time: number }[]; warnings?: string[]; mixOptions?: MixOptions;
   mixPending?: boolean; mixUnavailableReason?: string;
 };
+
+const presets: { id: PresetId; name: string; speed: number; musicVolume: number }[] = [
+  { id: "narration", name: "낭독 집중", speed: 0.90, musicVolume: 0.2 },
+  { id: "balanced", name: "균형", speed: 0.95, musicVolume: 0.5 },
+  { id: "immersive", name: "장면 몰입", speed: 1.00, musicVolume: 0.7 },
+];
 
 const voices = [
   { id: "F1", name: "여성 01", color: "lavender" },
@@ -47,6 +54,7 @@ export default function Home() {
   const [title, setTitle] = useState("나의 오디오북");
   const [voice, setVoice] = useState("F1");
   const [speed, setSpeed] = useState(0.95);
+  const [selectedPreset, setSelectedPreset] = useState<PresetId | null>("balanced");
   const [playingPreview, setPlayingPreview] = useState<string | null>(null);
   const [busy, setBusy] = useState(initialSoundscapeWait.current);
   const [waitingForSoundscape, setWaitingForSoundscape] = useState(initialSoundscapeWait.current);
@@ -148,6 +156,12 @@ export default function Home() {
   const changeLanguage = (next: Language) => {
     stopPreview();
     setLang(next);
+  };
+
+  const applyPreset = (preset: typeof presets[number]) => {
+    setSpeed(preset.speed);
+    setMusicVolume(preset.musicVolume);
+    setSelectedPreset(preset.id);
   };
 
   const playPreview = async (id: string) => {
@@ -414,10 +428,20 @@ export default function Home() {
                 <div className="panel-header compact"><div><div className="section-kicker">MAKE IT SOUND</div><h2><span className="section-number">03</span> 오디오 제작</h2><p>이야기를 들을 준비가 되었나요?</p></div><span className="sparkle"><Sparkles size={17} /></span></div>
                 <div className="setting-block"><span className="field-label">원고 언어</span><div className="language-toggle" role="group" aria-label="원고 언어"><button type="button" aria-pressed={lang === "ko"} className={lang === "ko" ? "active" : ""} onClick={() => changeLanguage("ko")} disabled={busy}>한국어 <span>KO</span></button><button type="button" aria-pressed={lang === "en"} className={lang === "en" ? "active" : ""} onClick={() => changeLanguage("en")} disabled={busy}>English <span>EN</span></button></div><p className="setting-hint">입력한 원고의 언어와 맞춰 주세요.</p></div>
                 <div className="setting-block selected-summary"><span className="field-label">선택한 목소리</span><div className="selection-row"><span className={`small-avatar ${selectedVoice.color}`}><AudioLines size={16} /></span><div><strong>{selectedVoice.name}</strong><small>{voice} · {lang === "ko" ? "한국어" : "English"}</small></div><Check size={16} /></div></div>
-                <div className="setting-block speed-block"><label className="field-label" htmlFor="speed">읽는 속도 <strong>{speed.toFixed(2)}×</strong></label><input id="speed" type="range" min="0.8" max="1.2" step="0.05" value={speed} onChange={event => setSpeed(Number(event.target.value))} disabled={busy} /><div className="range-label"><span>천천히</span><span>보통</span><span>빠르게</span></div></div>
+                <fieldset className="sound-options" aria-describedby="preset-help preset-existing-help">
+                  <legend>제작 프리셋</legend>
+                  {presets.map(preset => <button key={preset.id} type="button" className={`version-option ${selectedPreset === preset.id ? "selected" : ""}`} style={{ width: "100%", textAlign: "left" }} aria-pressed={selectedPreset === preset.id} onClick={() => applyPreset(preset)} disabled={busy}>
+                    <span className="version-copy"><strong>{preset.name}</strong><small>읽는 속도 {preset.speed.toFixed(2)}× · 배경 음악 {Math.round(preset.musicVolume * 100)}%</small></span>
+                    {selectedPreset === preset.id && <span className="version-selected" aria-hidden="true">선택됨</span>}
+                  </button>)}
+                  <p role="status" aria-live="polite">현재 설정: {selectedPreset ? `${presets.find(preset => preset.id === selectedPreset)!.name} 선택됨` : "수동 조절"} · 읽는 속도 {speed.toFixed(2)}× · 음악 크기 {Math.round(musicVolume * 100)}% · 배경 음악 {music ? "켜짐" : "꺼짐"}</p>
+                  <p id="preset-help">프리셋은 읽는 속도와 음악 크기만 바꿉니다. 배경 음악이 꺼져 있어도 크기를 조절할 수 있으며 자동으로 켜지지 않습니다. 효과음과 다른 설정은 그대로이며 아래 슬라이더로 직접 조절할 수 있습니다.</p>
+                  <p id="preset-existing-help">기존 낭독의 속도는 바뀌지 않습니다. 바뀐 속도로 들으려면 새로 제작해야 합니다. 기존 음향 포함 파일에 바뀐 음악 크기를 반영하려면 음향 설정을 다시 적용해야 합니다.</p>
+                </fieldset>
+                <div className="setting-block speed-block"><label className="field-label" htmlFor="speed">읽는 속도 <strong>{speed.toFixed(2)}×</strong></label><input id="speed" type="range" min="0.8" max="1.2" step="0.05" value={speed} aria-valuetext={`${speed.toFixed(2)}배`} onChange={event => { setSpeed(Number(event.target.value)); setSelectedPreset(null); }} disabled={busy} /><div className="range-label"><span>천천히</span><span>보통</span><span>빠르게</span></div></div>
                 <fieldset className="sound-options" aria-describedby="sound-help"><legend>자동 음향 <span>시범 기능</span></legend>
                   <label className="sound-toggle"><input type="checkbox" checked={music} onChange={event => setMusic(event.target.checked)} disabled={busy} /><span><strong>배경 음악</strong><small>차분한 음악을 자동으로 넣어요</small></span></label>
-                  <label className="sound-range" htmlFor="music-volume">음악 크기 <strong>{Math.round(musicVolume * 100)}%</strong></label><input className="sound-slider" id="music-volume" type="range" min="0" max="1" step="0.1" value={musicVolume} onChange={event => setMusicVolume(Number(event.target.value))} disabled={busy || !music} />
+                  <label className="sound-range" htmlFor="music-volume">음악 크기 <strong>{Math.round(musicVolume * 100)}%</strong></label><input className="sound-slider" id="music-volume" type="range" min="0" max="1" step="0.1" value={musicVolume} aria-valuetext={`${Math.round(musicVolume * 100)}%`} onChange={event => { setMusicVolume(Number(event.target.value)); setSelectedPreset(null); }} disabled={busy} />
                   <label className="sound-toggle"><input type="checkbox" checked={effects} onChange={event => setEffects(event.target.checked)} disabled={busy} /><span><strong>장면 효과음</strong><small>원고 속 단서에 맞춰 자동으로 넣어요</small></span></label>
                   <label className="sound-range" htmlFor="effects-volume">효과음 크기 <strong>{Math.round(effectsVolume * 100)}%</strong></label><input className="sound-slider" id="effects-volume" type="range" min="0" max="1" step="0.1" value={effectsVolume} onChange={event => setEffectsVolume(Number(event.target.value))} disabled={busy || !effects} />
                   <label className="sound-toggle"><input type="checkbox" checked={spatial} onChange={event => setSpatial(event.target.checked)} disabled={busy || (!music && !effects)} /><span><strong>입체 음향 · 이어폰 권장</strong><small>효과음에 창작적인 방향과 거리감을 더해요</small></span></label>
@@ -438,6 +462,7 @@ export default function Home() {
                 <div className="output-heading"><div><div className="section-kicker">YOUR AUDIO</div><h2>완성된 오디오</h2></div><span className="output-icon"><Headphones size={18} /></span></div>
                 {result ? <div className="audio-result"><div className="result-file"><span className="result-file-icon"><AudioLines size={20} /></span><div><strong>{result.title}</strong><small>{result.lang === "ko" ? "한국어" : "English"} · {result.voice} · {formatTime(result.duration)}</small></div><span className="ready-tag">{resultIsOutdated ? "이전 결과" : "완료"}</span></div>
                   {resultIsOutdated && <p className="stale-notice">현재 원고나 설정을 바꾸기 전에 만든 오디오입니다.</p>}
+                  {result.speed !== speed && <p className="stale-notice" role="status">기존 낭독은 {result.speed.toFixed(2)}× 속도로 그대로입니다. 현재 속도 {speed.toFixed(2)}×를 반영하려면 새로 제작해 주세요. 음향 재적용만으로는 낭독 속도가 바뀌지 않습니다.</p>}
                   {result.mixUrl ? <fieldset className="version-picker" aria-describedby="version-help">
                     <legend>들을 버전 선택</legend>
                     <p id="version-help">버전을 바꾸면 재생이 멈추고 처음부터 다시 재생됩니다.</p>
