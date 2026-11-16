@@ -1,0 +1,86 @@
+{
+  "note_ko": "시범용 AI 합성 효과음입니다. 실제 현장 녹음이 아니며 사람의 청취로 최종 검수되지 않았습니다. 실서비스에 사용할 때는 각 음원의 적합성과 권리를 직접 확인해 주세요.",
+  "model": "TinyAudio-MF CPU ONNX",
+  "model_url": "https://huggingface.co/junxiliu/TinyAudio",
+  "model_revision": "28e4c990d18044131e77e8528d5d79c3e7714891",
+  "code_url": "https://github.com/junxi25liu/TinyAudio",
+  "code_revision": "216cdfdcadbf16824b3716fd22e218221145696c",
+  "license": "MIT",
+  "validation_ko": "후보별 자동 분석 및 디코딩·피크 측정만 수행했습니다. AI 분석은 음성 부재나 자연스러움을 보증하지 않습니다.",
+  "effects": {
+    "rain": {
+      "file": "rain.mp3",
+      "prompt": "Rain falling heavily on the ground outside, a continuous wash of water and irregular raindrops.",
+      "seed": 802,
+      "source_offset_seconds": 0.0,
+      "sha256": "6d86428519eae22b775e6361489539af91f8e759507970f00c18f6f927f8030a",
+      "caution_ko": "자동 분류상 비 또는 폭포·물소리·백색소음으로, 사람 음성·입소리 징후는 없다고 판단. 앞 3초 신호가 일정하고 피크를 지키면서 상대적으로 목표 음량에 가까움. 사람 청취 검수가 필요합니다.",
+      "gain_db": -2.53,
+      "output_lufs": -23.41,
+      "output_true_peak_dbtp": -2.69
+    },
+    "forest": {
+      "file": "forest.mp3",
+      "prompt": "Small birds chirping in a quiet forest, with gentle wind rustling through tree leaves.",
+      "seed": 131,
+      "source_offset_seconds": 0.2,
+      "sha256": "b0d4becdc3ae98bdda2bdbcdb5a3c14fd4f129e99f3d5740c216f5d81e6ae5eb",
+      "caution_ko": "자동 분류상 새소리 중심의 숲 분위기, 사람 음성·입소리 징후는 없다고 판단. 잎사귀 소리는 뚜렷이 검증되지 않았고 AI가 녹음이라고 표현한 것은 잘못임. 사람 청취 검수가 필요합니다.",
+      "gain_db": 25.62,
+      "output_lufs": -21.16,
+      "output_true_peak_dbtp": -2.76
+    },
+    "ocean": {
+      "file": "ocean.mp3",
+      "prompt": "Ocean surf, waves breaking and washing up onto a sandy beach, with water receding.",
+      "seed": 149,
+      "source_offset_seconds": 0.65,
+      "sha256": "7775eaa5914ecf601a706a2847a03296945d3edeeb491501ba552566c217bf2e",
+      "caution_ko": "바람 또는 파도라는 중대한 분류 불확실성이 있어 파도로서 검증 실패. 앞부분 무음 약 0.65초를 잘랐지만 시범용 후보이며 사람 청취 검수가 필요합니다.",
+      "gain_db": -4.97,
+      "output_lufs": -20.25,
+      "output_true_peak_dbtp": -6.0
+    },
+    "footsteps": {
+      "file": "footsteps.mp3",
+      "prompt": "A person walking on a wooden floor, slow clear footsteps and shoe impacts.",
+      "seed": 847,
+      "source_offset_seconds": 0.7,
+      "sha256": "9de8253257069f8753b045259bc2a986137793d36e0d17d523e6485fe78f7c36",
+      "caution_ko": "자동 분류는 딱딱한 구두 발소리를 1순위로 보았으나 혀 클릭 대안을 배제하지 못함. 피크 제한 때문에 상당히 작은 소리이며 실제 입소리 여부도 미확정. 시범용 후보이며 사람 청취 검수가 필요합니다.",
+      "gain_db": 0.19,
+      "output_lufs": -39.53,
+      "output_true_peak_dbtp": -2.74
+    },
+    "door": {
+      "file": "door.mp3",
+      "prompt": "A wooden door handle clicks, the door creaks open and closes with a solid thud.",
+      "seed": 181,
+      "source_offset_seconds": 0.1,
+      "sha256": "8c0ec5c329bddacb786dfc1a65656c5d808a755bd52d6c2bdbaa0c8399e845d3",
+      "caution_ko": "문짝의 개폐·삐걱임이 아니라 자물쇠나 걸쇠 작동음으로 분류됨. 문 효과음으로 미확정이므로 시범용 후보이며 사람 청취 검수가 필요합니다.",
+      "gain_db": -2.99,
+      "output_lufs": -24.87,
+      "output_true_peak_dbtp": -2.65
+    },
+    "page": {
+      "file": "page.mp3",
+      "prompt": "A book being opened and pages turning, with soft dry paper rustling.",
+      "seed": 197,
+      "source_offset_seconds": 0.0,
+      "sha256": "7a637ffe9ba30feb12623340f8b64ffa1de10e8d709da8b6c3e7596b3a292d0c",
+      "caution_ko": "종이 넘김이 아니라 플라스틱 포장재 구김으로 분류됨. 피크 제한으로 음량도 작음. 시범용 후보이며 사람 청취 검수가 필요합니다.",
+      "gain_db": 2.18,
+      "output_lufs": -37.97,
+      "output_true_peak_dbtp": -2.76
+    }
+  },
+  "generation": {
+    "num_steps": 1,
+    "cfg_strength": 7.0,
+    "precision": "fp32",
+    "sample_rate_hz": 44100,
+    "runtime": "ONNX Runtime CPUExecutionProvider"
+  },
+  "processing_ko": "개별 파일에 시간적으로 일정한 선형 이득만 적용. 피크 제한 우선, 다이내믹 압축이나 루프 반복 없음. 원본 선두의 조용한 구간은 선택적으로 자름. MP3 192 kbps mono 44.1 kHz."
+}
