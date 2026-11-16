@@ -108,7 +108,8 @@ async function convert(request: Request): Promise<ConvertedAudio> {
   progress('오디오 변환기를 준비하고 있습니다.');
   const url = new URL('libav-6.10.9.0-obsolete.mjs', base).href;
   const imported: { default: LibAVTypes.LibAVWrapper } = await import(/* @vite-ignore */ url);
-  const libav = await imported.default.LibAV({ noworker: true, base: base.href });
+  // LibAV itself adds the separator before its module filename.
+  const libav = await imported.default.LibAV({ noworker: true, base: base.href.replace(/\/$/, '') });
   let inputCreated = false, outputCreated = false;
   let inputContext = 0, dc = 0, dp = 0, df = 0, ec = 0, ef = 0, ep = 0, outContext = 0, outputIO = 0, graph = 0;
   const writer = new ChunkWriter();

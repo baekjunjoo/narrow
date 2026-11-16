@@ -21,7 +21,8 @@ async function analyze(request: Request): Promise<QualityReport> {
   // Only same-origin app assets are fetched. The user's Blob is never sent to a network endpoint.
   const url = new URL('libav-6.10.9.0-obsolete.mjs', base).href;
   const imported: { default: LibAVTypes.LibAVWrapper } = await import(/* @vite-ignore */ url);
-  const libav = await imported.default.LibAV({ noworker: true, base: base.href });
+  // LibAV itself adds the separator before its module filename.
+  const libav = await imported.default.LibAV({ noworker: true, base: base.href.replace(/\/$/, '') });
   let inputCreated = false, inputContext = 0, dc = 0, dp = 0, df = 0;
   try {
     await libav.mkreadaheadfile('quality-input', blob);

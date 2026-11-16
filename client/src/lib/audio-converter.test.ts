@@ -22,9 +22,19 @@ beforeEach(() => {
   vi.stubGlobal('Worker', FakeWorker);
   vi.stubGlobal('window', { location: { href: 'https://example.test/app/' } });
 });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe('AudioConverter', () => {
+  it('passes the subpath LibAV directory to the worker', async () => {
+    vi.stubEnv('BASE_URL', '/narrow/');
+    const converter = new AudioConverter();
+    const pending = converter.convert(file(), 'wav', vi.fn());
+    const worker = FakeWorker.instances[0];
+    expect(worker.postMessage).toHaveBeenCalledWith(expect.objectContaining({ assetBase: 'https://example.test/narrow/libav/' }));
+    worker.emit({ type: 'success', result: result() });
+    await pending; converter.dispose();
+  });
+
   it('keeps progress separate from a successful result and passes the File intact', async () => {
     const converter = new AudioConverter();
     const report = vi.fn();

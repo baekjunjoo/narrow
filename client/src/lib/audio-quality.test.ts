@@ -17,9 +17,19 @@ class FakeWorker {
   emit(data: unknown) { this.onmessage?.({ data } as MessageEvent); }
 }
 beforeEach(() => { FakeWorker.instances = []; vi.stubGlobal('Worker', FakeWorker); vi.stubGlobal('window', { location: { href: 'https://example.test/app/' } }); });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe('AudioQualityAnalyzer', () => {
+  it('passes the subpath LibAV directory to the worker', async () => {
+    vi.stubEnv('BASE_URL', '/narrow/');
+    const a = new AudioQualityAnalyzer(), blob = new Blob(['x']);
+    const result = a.analyze(blob);
+    const worker = FakeWorker.instances[0];
+    expect(worker.postMessage).toHaveBeenCalledWith(expect.objectContaining({ assetBase: 'https://example.test/narrow/libav/' }));
+    worker.emit({ type: 'success', result: report() });
+    await result; a.dispose();
+  });
+
   it('passes a Blob intact and reports progress without trusting a UI callback', async () => {
     const a = new AudioQualityAnalyzer(), blob = new Blob(['x']);
     const result = a.analyze(blob, () => { throw new Error('UI'); });

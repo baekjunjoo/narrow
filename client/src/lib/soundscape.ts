@@ -13,7 +13,7 @@ type PlannedEffect = { name: EffectName; label: string; time: number; maxSeconds
 
 // These are relative to the current origin, never a third-party service. No text
 // from the manuscript is sent with these requests.
-const ASSET_ROOT = '/soundscape';
+const ASSET_ROOT = `${import.meta.env.BASE_URL}soundscape`;
 const EFFECT_ASSETS: EffectName[] = ['rain', 'forest', 'ocean', 'footsteps', 'door', 'page'];
 const SAMPLE_RATE = 44_100;
 const MAX_SECONDS = 600;

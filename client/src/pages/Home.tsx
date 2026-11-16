@@ -172,7 +172,7 @@ export default function Home() {
     }
     stopPreview();
     resultAudio.current?.pause();
-    const audio = new Audio(`/voice-previews/${lang}/${id}.mp3`);
+    const audio = new Audio(`${import.meta.env.BASE_URL}voice-previews/${lang}/${id}.mp3`);
     previewAudio.current = audio;
     audio.onended = () => { if (previewAudio.current === audio) stopPreview(); };
     audio.onerror = () => { if (previewAudio.current === audio) { stopPreview(); setError("목소리 미리보기를 불러오지 못했습니다. 다시 시도해 주세요."); } };
@@ -365,7 +365,7 @@ export default function Home() {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <a className="brand" href="/" aria-label="텍타일오디오 홈">
+        <a className="brand" href={import.meta.env.BASE_URL} aria-label="텍타일오디오 홈">
           <span className="brand-mark"><AudioLines size={23} strokeWidth={2.4} /></span>
           <span className="brand-word">텍타일오디오<span>.</span><small>오디오북 제작실</small></span>
         </a>
@@ -498,7 +498,7 @@ export default function Home() {
           </div>
           <QualityPanel sources={qualitySources} otherBusy={busy || batchBusy} onBusyChange={setQualityBusy} />
           <BatchConverter otherBusy={busy || qualityBusy} onBusyChange={setBatchBusy} />
-          <footer><span>© 텍타일오디오 · AI 생성 음성</span><span>Supertonic 3 · <a href="/licenses/index.html" target="_blank" rel="noreferrer">오픈소스 및 이용 조건</a></span></footer>
+          <footer><span>© 텍타일오디오 · AI 생성 음성</span><span>Supertonic 3 · <a href={`${import.meta.env.BASE_URL}licenses/index.html`} target="_blank" rel="noreferrer">오픈소스 및 이용 조건</a></span></footer>
         </div>
       </main>
     </div>

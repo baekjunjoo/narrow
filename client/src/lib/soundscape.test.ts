@@ -218,9 +218,26 @@ afterEach(async () => {
   await waitForSoundscapeIdle();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe('mixSoundscape', () => {
+  it('uses the Vite base for every same-origin asset without exposing manuscript cues', async () => {
+    vi.stubEnv('BASE_URL', '/narrow/');
+    vi.resetModules();
+    const { mixSoundscape: mixUnderBase } = await import('./soundscape');
+    for (const text of ['rain', 'forest', 'quiet']) {
+      vi.mocked(fetch).mockClear();
+      await mixUnderBase(voice(), [cue(text)], { ...options, music: true });
+      const requests = vi.mocked(fetch).mock.calls;
+      expect(requests.map(([url]) => url)).toEqual([
+        '/narrow/soundscape/music-calm.mp3',
+        ...effectUrls.map(url => `/narrow${url}`),
+      ]);
+      for (const [, init] of requests) expect(init).toEqual({ credentials: 'same-origin', signal: undefined });
+    }
+  });
+
   it('finds audible Korean and English actions within chunk bounds, throttling duplicate and nearby scenes', async () => {
     const result = await mixSoundscape(voice(), [
       cue('비가 내렸습니다.', 0),
