@@ -1,4 +1,4 @@
-export type Mp3Length = { samples: number; sampleRate: number; samplesPerFrame: number; gaplessSamples?: number };
+export type Mp3Length = { samples: number; sampleRate: number; samplesPerFrame: number; gaplessSamples?: number; truncatedBytes?: boolean };
 /** Decode only legal, non-free-format Layer III headers. */
 export function mp3FrameHeader(b: Uint8Array, at: number): { sampleRate: number; samplesPerFrame: number; size: number; sideInfo: number; crc: boolean; version: number } | null {
   if (at + 4 > b.length || b[at] !== 0xff || (b[at + 1] & 0xe0) !== 0xe0) return null;
@@ -16,7 +16,7 @@ export function mp3FrameHeader(b: Uint8Array, at: number): { sampleRate: number;
 }
 
 /** Parse a Xing/Info or VBRI count only at the expected offset in the first frame. */
-export function parseMp3Length(b: Uint8Array): Mp3Length | null {
+function parseMp3Metadata(b: Uint8Array): { length: Mp3Length; frameOffset: number; declaredBytes?: number } | null {
   const text = (at: number, s: string) => at >= 0 && at + s.length <= b.length && [...s].every((c, i) => b[at + i] === c.charCodeAt(0));
   const u32 = (at: number) => new DataView(b.buffer, b.byteOffset, b.byteLength).getUint32(at, false);
   for (let at = 0; at + 4 <= b.length; at++) {
@@ -48,20 +48,30 @@ export function parseMp3Length(b: Uint8Array): Mp3Length | null {
         const padding = ((b[encoder + 22] & 15) << 8) | b[encoder + 23];
         if (delay + padding < samples) gaplessSamples = delay + padding;
       }
-      return { samples, sampleRate: header.sampleRate, samplesPerFrame: header.samplesPerFrame, ...(gaplessSamples === undefined ? {} : { gaplessSamples }) };
+      const declaredBytes = flags & 2 ? u32(xing + 12) : 0;
+      return {
+        length: { samples, sampleRate: header.sampleRate, samplesPerFrame: header.samplesPerFrame, ...(gaplessSamples === undefined ? {} : { gaplessSamples }) },
+        frameOffset: at,
+        ...(declaredBytes >= header.size ? { declaredBytes } : {}),
+      };
     }
     const vbri = at + 36;
     if (vbri + 18 <= end && text(vbri, 'VBRI')) {
       const view = new DataView(b.buffer, b.byteOffset, b.byteLength);
+      const declaredBytes = u32(vbri + 10);
       const count = u32(vbri + 14);
-      if (view.getUint16(vbri + 4, false) === 1 && u32(vbri + 10) >= header.size && count) {
-        return { samples: count * header.samplesPerFrame, sampleRate: header.sampleRate, samplesPerFrame: header.samplesPerFrame };
+      if (view.getUint16(vbri + 4, false) === 1 && declaredBytes >= header.size && count) {
+        return { length: { samples: count * header.samplesPerFrame, sampleRate: header.sampleRate, samplesPerFrame: header.samplesPerFrame }, frameOffset: at, declaredBytes };
       }
     }
     // Only the first valid audio frame can carry a reliable duration declaration.
     return null;
   }
   return null;
+}
+
+export function parseMp3Length(b: Uint8Array): Mp3Length | null {
+  return parseMp3Metadata(b)?.length ?? null;
 }
 
 export async function mp3DeclaredLength(file: Blob): Promise<Mp3Length | null> {
@@ -75,13 +85,23 @@ export async function mp3DeclaredLength(file: Blob): Promise<Mp3Length | null> {
   // Jump over even a very large ID3 tag; never read it or the whole audio file.
   // Extra bytes allow a maximum-size Layer III frame and the following header.
   const bytes = new Uint8Array(await file.slice(offset, Math.min(file.size, offset + 64 * 1024 + 1500)).arrayBuffer());
-  return parseMp3Length(bytes);
+  const metadata = parseMp3Metadata(bytes);
+  if (!metadata) return null;
+  // Xing and VBRI bytes start at the audio frame, after any ID3v2 and leading junk.
+  // Trailing tags may hide some truncation, but must not be subtracted blindly.
+  return metadata.declaredBytes !== undefined && metadata.declaredBytes > file.size - offset - metadata.frameOffset
+    ? { ...metadata.length, truncatedBytes: true }
+    : metadata.length;
 }
 
 /** Use declared gapless trim where available, otherwise the two 12-bit maxima. */
 export function mp3LengthStatus(declared: Mp3Length | null, decodedSamples: number, sampleRate: number): 'unknown' | 'short' | 'ok' {
-  if (!declared || declared.sampleRate !== sampleRate) return 'unknown';
+  if (!declared) return 'unknown';
+  if (declared.truncatedBytes) return 'short';
+  if (declared.sampleRate !== sampleRate || !Number.isFinite(decodedSamples) || decodedSamples < 0) return 'unknown';
   const tolerance = (declared.gaplessSamples ?? 2 * 4095) + 2 * declared.samplesPerFrame;
   if (declared.samples <= tolerance) return 'unknown';
-  return decodedSamples < declared.samples - tolerance ? 'short' : 'ok';
+  if (decodedSamples < declared.samples - tolerance) return 'short';
+  // Extra frames or unreliable declarations must not be described as within tolerance.
+  return decodedSamples > declared.samples + 2 * declared.samplesPerFrame ? 'unknown' : 'ok';
 }

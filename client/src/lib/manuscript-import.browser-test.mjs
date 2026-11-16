@@ -17,10 +17,10 @@ try {
   await build({
     configFile: false,
     root: here,
-    publicDir: false,
+    publicDir: resolve(here, "../../public"),
     base: "/narrow/",
     logLevel: "error",
-    build: { outDir: join(temp, "dist"), emptyOutDir: true, rollupOptions: { input: join(here, "manuscript-import.browser-test.html") } },
+    build: { outDir: join(temp, "dist"), emptyOutDir: true, assetsInlineLimit: 0, rollupOptions: { input: join(here, "manuscript-import.browser-test.html") } },
   });
   server = createServer(async (req, res) => {
     requests.push(req.url);
@@ -76,10 +76,12 @@ try {
   if (!result) throw new Error("Browser test timed out");
   if (!result.ok) throw new Error(result.message);
   if (!requests.some(path => /^\/narrow\/assets\/pdf\.worker\.min-.*\.mjs/.test(path))) throw new Error(`No bundled PDF worker requested under /narrow/: ${requests}`);
+  if (!requests.some(path => path === "/narrow/cmaps/UniKS-UCS2-H.bcmap")) throw new Error(`No local UniKS-UCS2-H CMap requested under /narrow/: ${requests}`);
   if (network.some(url => !url.startsWith(origin + "/narrow/") && url !== "about:blank")) throw new Error(`Unexpected network request: ${network.join(", ")}`);
   if (requests.some(path => !path.startsWith("/narrow/"))) throw new Error(`Unexpected local request: ${requests}`);
   console.log(`PASS: ${result.message}`);
-  console.log(`PASS: bundled PDF worker served beneath /narrow/, with ${network.length} same-origin requests and no external requests`);
+  console.log(`PASS: bundled PDF worker and packed CMap served beneath /narrow/, with ${network.length} same-origin requests and no external requests`);
+  console.log(`CMaps requested: ${[...new Set(requests.filter(path => path.startsWith("/narrow/cmaps/")))].join(", ")}`);
 } finally {
   socket?.close();
   if (browser && browser.exitCode === null) {

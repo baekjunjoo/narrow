@@ -53,7 +53,7 @@ const expression = `(async () => {
   await run('MP3 without declared length',await get('no-xing.mp3'),r=>has(r,'원본 전체 길이를 검증할 수 없습니다'));
   await run('normal MP3',await get('normal.mp3'),r=>r.duration>11.9 && r.duration<12.1 && r.channels===1 && has(r,'16비트'));
   await run('truncated MP3',await get('truncated.mp3'),()=>true,true);
-  await run('frame-boundary truncated MP3',await get('truncated-boundary.mp3'),()=>true,'선언된 길이보다');
+  await run('frame-boundary truncated MP3',await get('truncated-boundary.mp3'),()=>true,'바이트 수 또는 오디오 길이');
   await run('normal FLAC',await get('normal.flac'),r=>Math.abs(r.duration-12)<.01);
   await run('truncated FLAC',await get('truncated.flac'),()=>true,true);
   await run('frame-boundary truncated FLAC',await get('truncated-boundary.flac'),()=>true,'선언된 샘플 수');

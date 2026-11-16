@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { AudioConverter } from './audio-converter';
-import { checkFloatFrame, ChunkWriter, mp3DeclaredLength, mp3LengthStatus, parseMp3Length } from './audio-converter.worker';
+import { checkFloatFrame, ChunkWriter, FlacIntegrity, inspectWav, mp3DeclaredLength, mp3LengthStatus, parseMp3Length, StreamingMd5 } from './audio-converter.worker';
 import type LibAVTypes from '@libav.js/variant-obsolete';
 
 class FakeWorker {
@@ -129,7 +130,98 @@ function mp3Header(marker: 'Xing' | 'Info' | 'VBRI' | 'none', version: 1 | 2 | 2
   return b;
 }
 
+/** A physically complete synthetic stream, not just two frames with a 100-frame declaration. */
+function completeMp3(marker: 'Xing' | 'VBRI'): Uint8Array {
+  const first = mp3Header(marker);
+  const frameSize = first.length / 2;
+  const audio = new Uint8Array(frameSize * 100);
+  audio.set(first);
+  for (let i = 2; i < 100; i++) audio.set(first.subarray(0, 4), i * frameSize);
+  return audio;
+}
+
 describe('MP3 declared length validation', () => {
+  it('does not claim a greatly excessive decoded length is within tolerance', () => {
+    const length = { samples: 100 * 1152, sampleRate: 44100, samplesPerFrame: 1152 };
+    expect(mp3LengthStatus(length, length.samples + 100 * 1152, 44100)).toBe('unknown');
+  });
+
+  it('detects an incomplete Xing byte count even when decoded samples are close enough', async () => {
+    const audio = mp3Header('Xing');
+    const blob = new Blob([new Uint8Array(audio)]);
+    const declaration = await mp3DeclaredLength(blob);
+    expect(mp3LengthStatus(declaration, 100 * 1152, 44100)).toBe('short');
+  });
+
+  it('counts Xing bytes from the first audio frame after ID3, not from the start of the file', async () => {
+    const audio = mp3Header('Xing');
+    new DataView(audio.buffer).setUint32(48, audio.length);
+    const tag = new Uint8Array(1010);
+    tag.set([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 7, 104]); // 1000-byte tag
+    const valid = new Blob([tag, new Uint8Array(audio)]);
+    const cut = new Blob([tag, new Uint8Array(audio.slice(0, -1))]);
+    expect(mp3LengthStatus(await mp3DeclaredLength(valid), 115200, 44100)).toBe('ok');
+    expect(mp3LengthStatus(await mp3DeclaredLength(cut), 115200, 44100)).toBe('short');
+  });
+
+  it('checks a physically complete VBRI stream and detects a whole missing frame despite sample tolerance', async () => {
+    const audio = completeMp3('VBRI');
+    const frameSize = audio.length / 100;
+    const full = await mp3DeclaredLength(new Blob([new Uint8Array(audio)]));
+    const cut = await mp3DeclaredLength(new Blob([audio.slice(0, -frameSize)]));
+    expect(full).toEqual({ samples: 115200, sampleRate: 44100, samplesPerFrame: 1152 });
+    expect(mp3LengthStatus(full, 115200, 44100)).toBe('ok');
+    expect(cut?.truncatedBytes).toBe(true);
+    expect(mp3LengthStatus(cut, 99 * 1152, 44100)).toBe('short');
+  });
+
+  it('measures VBRI bytes from the first frame after an ID3 tag and leading junk', async () => {
+    const audio = completeMp3('VBRI');
+    const tag = new Uint8Array(1010);
+    tag.set([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 7, 104]);
+    const junk = new Uint8Array(13);
+    const full = new Blob([tag, junk, new Uint8Array(audio)]);
+    const cut = new Blob([tag, junk, audio.slice(0, -(audio.length / 100))]);
+    expect(mp3LengthStatus(await mp3DeclaredLength(full), 115200, 44100)).toBe('ok');
+    expect(mp3LengthStatus(await mp3DeclaredLength(cut), 99 * 1152, 44100)).toBe('short');
+  });
+
+  it('rejects malformed VBRI count and byte fields instead of treating them as declarations', () => {
+    const tooSmall = completeMp3('VBRI');
+    new DataView(tooSmall.buffer).setUint32(46, tooSmall.length / 100 - 1);
+    expect(parseMp3Length(tooSmall)).toBeNull();
+    const zeroFrames = completeMp3('VBRI');
+    new DataView(zeroFrames.buffer).setUint32(50, 0);
+    expect(parseMp3Length(zeroFrames)).toBeNull();
+    const wrongVersion = completeMp3('VBRI');
+    new DataView(wrongVersion.buffer).setUint16(40, 2);
+    expect(parseMp3Length(wrongVersion)).toBeNull();
+  });
+
+  it('does not read VBRI frame-count bytes across the first-frame boundary', () => {
+    const b = new Uint8Array(104);
+    b.set([0xff, 0xe3, 0x10, 0], 0); // MPEG 2.5: 52-byte frames
+    b.set(new TextEncoder().encode('VBRI'), 36);
+    const v = new DataView(b.buffer);
+    v.setUint16(40, 1); v.setUint32(46, 104); v.setUint32(50, 2);
+    expect(parseMp3Length(b)).toBeNull();
+  });
+
+  it('accepts a complete ID3-tagged Xing stream with a LAME gapless declaration', async () => {
+    const audio = completeMp3('Xing');
+    const encoder = 36 + 16;
+    audio.set(new TextEncoder().encode('LAME3.100'), encoder);
+    audio.set([0x24, 0x05, 0x40], encoder + 21);
+    const tag = new Uint8Array(1010);
+    tag.set([0x49, 0x44, 0x33, 4, 0, 0, 0, 0, 7, 104]);
+    const declaration = await mp3DeclaredLength(new Blob([tag, new Uint8Array(audio)]));
+    expect(declaration).toEqual({ samples: 115200, sampleRate: 44100, samplesPerFrame: 1152, gaplessSamples: 1920 });
+    expect(mp3LengthStatus(declaration, 115200 - 1920, 44100)).toBe('ok');
+    // A one-byte disagreement is rejected as inconsistent metadata, not proof of audible loss.
+    const cut = await mp3DeclaredLength(new Blob([tag, audio.slice(0, -1)]));
+    expect(mp3LengthStatus(cut, 115200 - 1920, 44100)).toBe('short');
+  });
+
   it.each([
     ['Info', 1, false, false, 44100, 1152],
     ['Xing', 1, true, true, 44100, 1152],
@@ -176,6 +268,8 @@ describe('MP3 declared length validation', () => {
     expect(mp3LengthStatus(length, Math.floor(3.985 * 48000), 48000)).toBe('short');
     expect(mp3LengthStatus(length, length.samples - (8190 + 2304), 48000)).toBe('ok');
     expect(mp3LengthStatus(length, length.samples - (8190 + 2304) - 1, 48000)).toBe('short');
+    expect(mp3LengthStatus(length, length.samples + 2304, 48000)).toBe('ok');
+    expect(mp3LengthStatus(length, length.samples + 2305, 48000)).toBe('unknown');
     expect(mp3LengthStatus(null, 100000, 48000)).toBe('unknown');
     expect(mp3LengthStatus(length, 384000, 44100)).toBe('unknown');
     expect(mp3LengthStatus({ ...length, samples: 2 * 1152 }, 1000, 48000)).toBe('unknown');
@@ -191,6 +285,208 @@ describe('MP3 declared length validation', () => {
     expect(await mp3DeclaredLength(fake)).toEqual({ samples: 115200, sampleRate: 44100, samplesPerFrame: 1152 });
     expect(slice).toHaveBeenNthCalledWith(1, 0, 10);
     expect(slice).toHaveBeenNthCalledWith(2, tagSize + 10, tagSize + 10 + 64 * 1024 + 1500);
+  });
+});
+
+/** A minimal PCM RIFF or RF64 container, with optionally dishonest chunk sizes. */
+function wavFixture(rf64: boolean, options: { dataDeclared?: number; dataActual?: number; riffDeclared?: number; align?: number; sampleCount?: bigint; formatTag?: number } = {}): Blob {
+  const actual = options.dataActual ?? 8;
+  const prefix = rf64 ? 80 : 44;
+  const b = new Uint8Array(prefix + actual);
+  const v = new DataView(b.buffer);
+  const text = (at: number, value: string) => b.set(new TextEncoder().encode(value), at);
+  text(0, rf64 ? 'RF64' : 'RIFF'); v.setUint32(4, rf64 ? 0xffffffff : options.riffDeclared ?? b.length - 8, true); text(8, 'WAVE');
+  let at = 12;
+  if (rf64) {
+    text(at, 'ds64'); v.setUint32(at + 4, 28, true);
+    v.setBigUint64(at + 8, BigInt(options.riffDeclared ?? b.length - 8), true);
+    v.setBigUint64(at + 16, BigInt(options.dataDeclared ?? actual), true);
+    v.setBigUint64(at + 24, options.sampleCount ?? 0n, true); at += 36;
+  }
+  text(at, 'fmt '); v.setUint32(at + 4, 16, true); v.setUint16(at + 8, options.formatTag ?? 1, true);
+  v.setUint16(at + 10, 2, true); v.setUint32(at + 12, 44100, true);
+  v.setUint32(at + 16, 176400, true); v.setUint16(at + 20, options.align ?? 4, true); v.setUint16(at + 22, 16, true); at += 24;
+  text(at, 'data'); v.setUint32(at + 4, rf64 ? 0xffffffff : options.dataDeclared ?? actual, true);
+  return new Blob([b]);
+}
+
+/** Mono IMA ADPCM: an 8-byte block contains nine samples, not eight PCM frames. */
+function rf64Adpcm(sampleCount: bigint): Blob {
+  const b = new Uint8Array(104);
+  const v = new DataView(b.buffer);
+  const text = (at: number, value: string) => b.set(new TextEncoder().encode(value), at);
+  text(0, 'RF64'); v.setUint32(4, 0xffffffff, true); text(8, 'WAVE');
+  text(12, 'ds64'); v.setUint32(16, 28, true);
+  v.setBigUint64(20, BigInt(b.length - 8), true); v.setBigUint64(28, 8n, true); v.setBigUint64(36, sampleCount, true);
+  text(48, 'fmt '); v.setUint32(52, 20, true); v.setUint16(56, 0x11, true);
+  v.setUint16(58, 1, true); v.setUint32(60, 8000, true); v.setUint32(64, 7111, true);
+  v.setUint16(68, 8, true); v.setUint16(70, 4, true); v.setUint16(72, 2, true); v.setUint16(74, 9, true);
+  text(76, 'fact'); v.setUint32(80, 4, true); v.setUint32(84, 9, true);
+  text(88, 'data'); v.setUint32(92, 0xffffffff, true);
+  return new Blob([b]);
+}
+
+describe('WAV container integrity', () => {
+  it.each([false, true])('accepts complete PCM (RF64=%s)', async rf64 => {
+    await expect(inspectWav(wavFixture(rf64))).resolves.toEqual({ samples: 2, warnings: [] });
+  });
+
+  it('accepts matching or unknown-zero RF64 ds64 sample counts for PCM', async () => {
+    await expect(inspectWav(wavFixture(true, { sampleCount: 2n }))).resolves.toEqual({ samples: 2, warnings: [] });
+    await expect(inspectWav(wavFixture(true, { sampleCount: 0n }))).resolves.toEqual({ samples: 2, warnings: [] });
+  });
+
+  it.each([1n, 3n])('rejects a contradictory RF64 ds64 sample count %s for complete PCM', async sampleCount => {
+    await expect(inspectWav(wavFixture(true, { sampleCount }))).rejects.toThrow('손상');
+  });
+
+  it('compares ds64 for uncompressed float and WAVE_FORMAT_EXTENSIBLE PCM', async () => {
+    const float = new Uint8Array(await wavFixture(true, { sampleCount: 1n, formatTag: 3, align: 8 }).arrayBuffer());
+    new DataView(float.buffer).setUint16(70, 32, true);
+    await expect(inspectWav(new Blob([float]))).resolves.toEqual({ samples: 1, warnings: [] });
+    new DataView(float.buffer).setBigUint64(36, 2n, true);
+    await expect(inspectWav(new Blob([float]))).rejects.toThrow('손상');
+
+    const original = new Uint8Array(await wavFixture(true, { sampleCount: 2n }).arrayBuffer());
+    const ext = new Uint8Array(original.length + 24);
+    ext.set(original.subarray(0, 72)); ext.set(original.subarray(72), 96);
+    const v = new DataView(ext.buffer);
+    v.setBigUint64(20, BigInt(ext.length - 8), true); v.setUint32(52, 40, true); v.setUint16(56, 0xfffe, true);
+    v.setUint16(72, 22, true); v.setUint16(74, 16, true); v.setUint32(76, 3, true);
+    ext.set([1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113], 80);
+    await expect(inspectWav(new Blob([ext]))).resolves.toEqual({ samples: 2, warnings: [] });
+    v.setBigUint64(36, 3n, true);
+    await expect(inspectWav(new Blob([ext]))).rejects.toThrow('손상');
+  });
+
+  it('does not compare RF64 sample counts for legal non-PCM ADPCM data', async () => {
+    const result = await inspectWav(rf64Adpcm(9n));
+    expect(result.samples).toBeNull();
+    expect(result.warnings.join(' ')).toContain('ds64');
+    expect(result.warnings.join(' ')).toContain('확인할 수 없');
+    const unknown = await inspectWav(rf64Adpcm(0n));
+    expect(unknown.samples).toBeNull();
+    expect(unknown.warnings.join(' ')).toContain('검증이 제한');
+  });
+
+  it('compares a safe integer RF64 sample count at the upper boundary', async () => {
+    await expect(inspectWav(wavFixture(true, { sampleCount: BigInt(Number.MAX_SAFE_INTEGER) }))).rejects.toThrow('손상');
+  });
+
+  it('warns rather than rejecting a ds64 count beyond the safe integer range', async () => {
+    const result = await inspectWav(wavFixture(true, { sampleCount: BigInt(Number.MAX_SAFE_INTEGER) + 1n }));
+    expect(result.samples).toBe(2);
+    expect(result.warnings.join(' ')).toContain('ds64');
+    expect(result.warnings.join(' ')).toContain('확인할 수 없');
+  });
+
+  it('warns rather than comparing when multiple RF64 data chunks are present', async () => {
+    const original = new Uint8Array(await wavFixture(true, { sampleCount: 200n }).arrayBuffer());
+    const b = new Uint8Array(original.length + 12);
+    b.set(original); b.set(new TextEncoder().encode('data'), original.length);
+    const v = new DataView(b.buffer);
+    v.setUint32(original.length + 4, 4, true);
+    v.setBigUint64(20, BigInt(b.length - 8), true);
+    const result = await inspectWav(new Blob([b]));
+    expect(result.samples).toBeNull();
+    expect(result.warnings.join(' ')).toContain('ds64');
+  });
+
+  it('warns rather than comparing RF64 ds64 when PCM format fields make alignment ambiguous', async () => {
+    const result = await inspectWav(wavFixture(true, { sampleCount: 20n, align: 2 }));
+    expect(result.samples).toBeNull();
+    expect(result.warnings.join(' ')).toContain('ds64');
+  });
+
+  it('warns rather than comparing RF64 ds64 after an incomplete chunk scan', async () => {
+    const original = new Uint8Array(await wavFixture(true, { sampleCount: 20n }).arrayBuffer());
+    const b = new Uint8Array(original.length + 4097 * 8);
+    b.set(original);
+    for (let i = 0; i < 4097; i++) b.set(new TextEncoder().encode('JUNK'), original.length + i * 8);
+    new DataView(b.buffer).setBigUint64(20, BigInt(b.length - 8), true);
+    const result = await inspectWav(new Blob([b]));
+    expect(result.samples).toBeNull();
+    expect(result.warnings.join(' ')).toContain('ds64');
+  });
+
+  it('warns rather than comparing RF64 ds64 when multiple fmt chunks make the layout ambiguous', async () => {
+    const original = new Uint8Array(await wavFixture(true, { sampleCount: 20n }).arrayBuffer());
+    const b = new Uint8Array(original.length + 24);
+    b.set(original); b.set(original.subarray(48, 72), original.length);
+    new DataView(b.buffer).setBigUint64(20, BigInt(b.length - 8), true);
+    const result = await inspectWav(new Blob([b]));
+    expect(result.samples).toBeNull();
+    expect(result.warnings.join(' ')).toContain('ds64');
+  });
+
+  it.each([false, true])('rejects data extending beyond the physical file (RF64=%s)', async rf64 => {
+    await expect(inspectWav(wavFixture(rf64, { dataDeclared: 16 }))).rejects.toThrow();
+  });
+
+  it.each([false, true])('rejects incomplete sample frames (RF64=%s)', async rf64 => {
+    await expect(inspectWav(wavFixture(rf64, { dataDeclared: 6, dataActual: 6 }))).rejects.toThrow();
+  });
+
+  it.each([false, true])('rejects zero PCM block alignment (RF64=%s)', async rf64 => {
+    await expect(inspectWav(wavFixture(rf64, { align: 0 }))).rejects.toThrow();
+  });
+
+  it('accepts a final unpadded odd byte for an aligned 8-bit PCM file', async () => {
+    const wav = new Uint8Array(await wavFixture(false, { dataDeclared: 3, dataActual: 3, align: 1 }).arrayBuffer());
+    const v = new DataView(wav.buffer); v.setUint16(22, 1, true); v.setUint16(34, 8, true);
+    await expect(inspectWav(new Blob([wav]))).resolves.toEqual({ samples: 3, warnings: [] });
+  });
+
+  it('limits many unknown chunks and explicitly warns when the scan is incomplete', async () => {
+    const chunks = 4097;
+    const b = new Uint8Array(12 + chunks * 8); const v = new DataView(b.buffer);
+    b.set(new TextEncoder().encode('RIFF'), 0); v.setUint32(4, b.length - 8, true); b.set(new TextEncoder().encode('WAVE'), 8);
+    for (let i = 0; i < chunks; i++) b.set(new TextEncoder().encode('JUNK'), 12 + i * 8);
+    const inspected = await inspectWav(new Blob([b]));
+    expect(inspected.samples).toBeNull(); expect(inspected.warnings.join(' ')).toContain('검증이 제한');
+  });
+});
+
+describe('streaming FLAC integrity', () => {
+  it.each([0, 1, 55, 56, 63, 64, 65, 1000, 65537])('matches an independent MD5 for %i bytes in irregular chunks', size => {
+    const data = Uint8Array.from({ length: size }, (_, i) => (i * 71 + 11) & 255);
+    const md5 = new StreamingMd5();
+    for (let i = 0; i < size; i += 37) md5.update(data.subarray(i, i + 37));
+    expect(Buffer.from(md5.digest()).toString('hex')).toBe(createHash('md5').update(data).digest('hex'));
+  });
+
+  it('hashes signed 20-bit samples in channel-interleaved, sign-extended little endian order', () => {
+    const expected = createHash('md5').update(Buffer.from([0xff, 0xff, 0xff, 1, 0, 0, 0, 0, 0xf8, 0xff, 0xff, 0x07])).digest();
+    const formats = { s16: 1, s16p: 6, s32: 2, s32p: 7 };
+    const checker = new FlacIntegrity(20, 2, expected, formats);
+    checker.add({ format: 7, nb_samples: 2, data: [new Int32Array([-4096, -2147483648]), new Int32Array([4096, 2147479552])] } as LibAVTypes.Frame);
+    expect(checker.result()).toBe('verified');
+    const corrupt = new FlacIntegrity(20, 2, expected, formats);
+    corrupt.add({ format: 7, nb_samples: 2, data: [new Int32Array([0, -2147483648]), new Int32Array([4096, 2147479552])] } as LibAVTypes.Frame);
+    expect(corrupt.result()).toBe('mismatch');
+  });
+
+  it('reports unavailable rather than a false mismatch for missing MD5 or an unknown decoded layout', () => {
+    const formats = { s16: 1, s16p: 6, s32: 2, s32p: 7 };
+    expect(new FlacIntegrity(16, 1, new Uint8Array(16), formats).result()).toBe('unavailable');
+    const unknown = new FlacIntegrity(16, 1, new Uint8Array(16).fill(1), formats);
+    unknown.add({ format: 100, nb_samples: 1, data: new Float32Array([0]) } as LibAVTypes.Frame);
+    expect(unknown.result()).toBe('unavailable');
+  });
+
+  it.each([8, 12, 16, 20, 24, 32])('matches independent signed PCM serialization at %i bits', bits => {
+    const formats = { s16: 1, s16p: 6, s32: 2, s32p: 7 };
+    const min = -(2 ** (bits - 1)), max = 2 ** (bits - 1) - 1;
+    const samples = [min, max, -1, 0, 1, 0]; // interleaved stereo
+    const width = bits <= 16 ? 16 : 32;
+    const native = width === 16 ? Int16Array : Int32Array;
+    const packed = new native(samples.map(n => n * 2 ** (width - bits)));
+    const nbytes = Math.ceil(bits / 8), serialized = Buffer.alloc(samples.length * nbytes);
+    samples.forEach((value, i) => serialized.writeIntLE(value, i * nbytes, nbytes));
+    const expected = createHash('md5').update(serialized).digest();
+    const checker = new FlacIntegrity(bits, 2, expected, formats);
+    checker.add({ format: width === 16 ? 1 : 2, nb_samples: 3, data: packed } as LibAVTypes.Frame);
+    expect(checker.result()).toBe('verified');
   });
 });
 

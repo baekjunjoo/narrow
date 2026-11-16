@@ -46,6 +46,18 @@ class Tests(unittest.TestCase):
         self.assertFalse(android.is_address_ready(ET.fromstring(PAGE)))
         self.assertTrue(android.inspect_webview(ET.fromstring(ADDRESS))[1])
 
+    def test_android_file_import_control_name_and_role(self):
+        for control, expected in [
+            ('<node class="android.widget.Button" text="파일 불러오기"/>', 'PASS'),
+            ('<node class="android.widget.Button" text="TXT 불러오기"/>', 'MANUAL'),
+            ('<node class="android.widget.TextView" text="파일 불러오기"/>', 'MANUAL'),
+        ]:
+            page = '<hierarchy><node package="com.android.chrome" class="android.webkit.WebView">' + control + '</node></hierarchy>'
+            with tempfile.TemporaryDirectory() as td:
+                _, _, report = self.run_android(td, page=page)
+                checks = {check['check']: check['status'] for check in report['checks']}
+                self.assertEqual(checks['웹 계층: 파일 불러오기 버튼'], expected)
+
     @unittest.skipUnless(shutil.which('chromium'), 'Chromium 없음: DOM 실브라우저 테스트 생략')
     def test_safari_inspect_logic_in_real_dom(self):
         script = (Path(__file__).parent / 'safari_inspect.js').read_text(encoding='utf-8')

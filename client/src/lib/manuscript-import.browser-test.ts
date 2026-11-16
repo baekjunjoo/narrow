@@ -2,6 +2,11 @@ import { PDFDocument, PDFName, PDFString } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import { strToU8, zipSync } from "fflate";
 import fontUrl from "../../public/fonts/NarravoReportKR-Regular.ttf?url";
+import koreanCidUrl from "./manuscript-import.browser-test.korean.pdf?url";
+import mixedCidUrl from "./manuscript-import.browser-test.mixed.pdf?url";
+import listDocxUrl from "./manuscript-import.browser-test.list.docx?url";
+import hyphensDocxUrl from "./manuscript-import.browser-test.hyphens.docx?url";
+import mathDocxUrl from "./manuscript-import.browser-test.math.docx?url";
 import { extractManuscript } from "./manuscript-import";
 
 declare global { interface Window { __importTestResult?: { ok: boolean; message: string }; __pdfExecuted?: boolean } }
@@ -62,4 +67,73 @@ async function run() {
   assert(!window.__pdfExecuted, "PDF JavaScript executed after extraction");
   return "Korean/English PDF with image-only page, JavaScript and external link; encrypted, damaged and empty PDFs; full DOCX text, tables, external link and empty document";
 }
-run().then(message => { window.__importTestResult = { ok: true, message }; }).catch(error => { window.__importTestResult = { ok: false, message: error instanceof Error ? error.stack || error.message : String(error) }; });
+
+// ReportLab-generated CIDFontType2 PDFs use UniKS-UCS2-H and have no ToUnicode map.
+// They exercise a different PDF.js path than the embedded font generated above.
+async function regressions() {
+  const errors: string[] = [];
+  const check = async (name: string, fn: () => Promise<void>) => {
+    try { await fn(); } catch (error) { errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+  const docx = (body: string, mathNamespace = "http://schemas.openxmlformats.org/officeDocument/2006/math") => toFile(zipSync({ "word/document.xml": strToU8(`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:m="${mathNamespace}"><w:body>${body}</w:body></w:document>`) }), "regression.docx");
+
+  await check("Korean-only CID PDF", async () => {
+    const result = await extractManuscript(toFile(new Uint8Array(await (await fetch(koreanCidUrl)).arrayBuffer()), "korean.pdf"));
+    assert(result.text.includes("한글 원고 한국어 테스트"), `Korean text missing: ${result.text}`);
+  });
+  await check("Korean + English CID PDF", async () => {
+    const result = await extractManuscript(toFile(new Uint8Array(await (await fetch(mixedCidUrl)).arrayBuffer()), "mixed-cid.pdf"));
+    assert(result.text.includes("Introduction in English"), `English missing: ${result.text}`);
+    assert(result.text.includes("한글 원고 English 한국어 테스트"), `Korean text missing: ${result.text}`);
+  });
+  await check("paragraph-property tabs and list warning", async () => {
+    const doc = await extractManuscript(docx('<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr><w:tabs><w:tab w:val="clear" w:pos="709"/><w:tab w:val="left" w:pos="709"/></w:tabs></w:pPr><w:r><w:t>첫 항목</w:t><w:tab/><w:t>본문 탭</w:t></w:r></w:p>'));
+    assert(doc.text === "첫 항목\t본문 탭", `Property tab leaked into body: ${JSON.stringify(doc.text)}`);
+    assert(doc.warnings.some(w => /목록/.test(w) && /번호|글머리/.test(w)), `Missing list numbering warning: ${doc.warnings}`);
+  });
+  await check("Word no-break and soft hyphens", async () => {
+    const doc = await extractManuscript(docx('<w:p><w:r><w:t>한글</w:t><w:noBreakHyphen/><w:t>영어 co</w:t><w:softHyphen/><w:t>operate</w:t></w:r></w:p>'));
+    assert(doc.text === "한글\u2011영어 co\u00adoperate", `Hyphens missing: ${JSON.stringify(doc.text)}`);
+  });
+  await check("LibreOffice DOCX reproductions", async () => {
+    const read = async (url: string) => extractManuscript(toFile(new Uint8Array(await (await fetch(url)).arrayBuffer()), "actual.docx"));
+    const list = await read(listDocxUrl);
+    assert(list.text === "준비 목록\n첫 항목 English one\n둘째 항목 English two", `Real list text: ${JSON.stringify(list.text)}`);
+    assert(list.warnings.some(w => /목록/.test(w) && /번호|글머리/.test(w)), `Real list missing warning: ${list.warnings}`);
+    const damaged = new Uint8Array(await (await fetch(listDocxUrl)).arrayBuffer());
+    const view = new DataView(damaged.buffer);
+    let central = -1;
+    for (let i = 0; i <= damaged.length - 46; i++) {
+      if (view.getUint32(i, true) !== 0x02014b50) continue;
+      const nameLength = view.getUint16(i + 28, true);
+      const name = new TextDecoder().decode(damaged.subarray(i + 46, i + 46 + nameLength));
+      if (name === "word/document.xml") { central = i; break; }
+    }
+    assert(central >= 0, "Real DOCX body not found");
+    view.setUint32(central + 16, view.getUint32(central + 16, true) ^ 1, true);
+    await mustReject(toFile(damaged, "damaged-real.docx"), /손상.*암호화/);
+    const hyphens = await read(hyphensDocxUrl);
+    assert(hyphens.text.startsWith("한글\u2011영어 co\u00adoperate\n"), `Real hyphens missing: ${JSON.stringify(hyphens.text)}`);
+    const math = await read(mathDocxUrl);
+    assert(math.text.startsWith("방정식  입니다.\n") && !math.text.includes("x + 1 = 2"), `Real OMML incorrectly represented: ${math.text}`);
+    assert(math.warnings.some(w => /수식/.test(w) && /누락|추출하지/.test(w)), `Real OMML missing warning: ${math.warnings}`);
+  });
+  for (const namespace of ["http://schemas.openxmlformats.org/officeDocument/2006/math", "http://purl.oclc.org/ooxml/officeDocument/math"]) {
+    await check(`OMML warning ${namespace}`, async () => {
+      const formula = '<m:oMath><m:f><m:num><m:r><m:t>x</m:t></m:r></m:num><m:den><m:r><m:t>y</m:t></m:r></m:den></m:f></m:oMath>';
+      const doc = await extractManuscript(docx(`<w:p><w:r><w:t>수식 앞</w:t></w:r>${formula}<w:r><w:t>수식 뒤</w:t></w:r></w:p>`, namespace));
+      assert(doc.text === "수식 앞수식 뒤", `Complex formula was misrepresented: ${doc.text}`);
+      assert(doc.warnings.some(w => /수식/.test(w) && /누락|추출하지/.test(w)), `Missing formula warning: ${doc.warnings}`);
+      await mustReject(docx(`<w:p>${formula}</w:p>`, namespace), /수식/);
+    });
+  }
+  if (errors.length) throw new Error(errors.join("\n"));
+  return "UniKS-UCS2-H Korean-only and mixed PDFs; real and synthetic DOCX property tabs, hyphens, list and complex OMML warnings";
+}
+
+Promise.allSettled([run(), regressions()]).then(results => {
+  const errors = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  window.__importTestResult = errors.length
+    ? { ok: false, message: errors.map(result => String(result.reason)).join("\n") }
+    : { ok: true, message: results.map(result => (result as PromiseFulfilledResult<string>).value).join("; ") };
+});

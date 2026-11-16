@@ -20,18 +20,20 @@ export async function loadReportFont(): Promise<ArrayBuffer> {
   return response.arrayBuffer();
 }
 
-function printableText(value: string): string {
+function printableText(value: string, supported: Set<number>): string {
   // The PDF font intentionally has no shaping tables. Compose decomposed Hangul
   // (e.g. macOS filenames) before drawing; the CSV retains the original string.
-  // Newlines stay as line breaks. Other controls are represented explicitly.
-  return value.normalize("NFC").replace(/\r\n?/g, "\n").replace(/[\p{Cc}\p{Cf}]/gu, ch => {
+  // Newlines stay as line breaks. Controls and unsupported code points are
+  // explicitly represented, never silently dropped or replaced with tofu.
+  return Array.from(value.normalize("NFC").replace(/\r\n?/g, "\n"), ch => {
     if (ch === "\n") return ch;
     const cp = ch.codePointAt(0)!;
+    if (!/[\p{Cc}\p{Cf}]/u.test(ch) && supported.has(cp)) return ch;
     return `[U+${cp.toString(16).toUpperCase().padStart(4, "0")}]`;
-  });
+  }).join("");
 }
 
-/** Split without a length/line limit. Overlong unbroken strings wrap by code point. */
+/** Keep fitting numeric values and explicit U+ escapes intact; split longer strings by code point. */
 function wrap(text: string, font: PDFFont, widths: Map<string, number>): string[] {
   const lines: string[] = [];
   const maxWidth = PAGE_WIDTH - 2 * MARGIN;
@@ -58,15 +60,23 @@ function wrap(text: string, font: PDFFont, widths: Map<string, number>): string[
   for (const paragraph of text.split("\n")) {
     let line = "";
     let width = 0;
-    for (const char of paragraph) {
-      const next = charWidth(char);
-      if (line && width + next > maxWidth - 5) {
-        pushChecked(line);
-        line = "";
-        width = 0;
+    const tokens = paragraph.match(/(?:\[U\+[0-9A-F]{4,6}\])+|[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|[\s\S]/gu) || [];
+    for (const token of tokens) {
+      const chars = Array.from(token);
+      const tokenWidth = chars.reduce((sum, char) => sum + charWidth(char), 0);
+      // Overlong free-form strings may be broken, but ordinary finite JS
+      // numbers and U+ escapes fit comfortably within a page-wide line.
+      const parts = tokenWidth <= maxWidth - 5 ? [token] : token.match(/\[U\+[0-9A-F]{4,6}\]|[\s\S]/gu) || [];
+      for (const part of parts) {
+        const next = part === token ? tokenWidth : Array.from(part).reduce((sum, char) => sum + charWidth(char), 0);
+        if (line && width + next > maxWidth - 5) {
+          pushChecked(line);
+          line = "";
+          width = 0;
+        }
+        line += part;
+        width += next;
       }
-      line += char;
-      width += next;
     }
     pushChecked(line);
   }
@@ -83,9 +93,9 @@ export async function createQualityPdf(input: CompletedQualityReport, fontBytes:
   const supported = new Set(font.getCharacterSet());
   const texts = [
     "오디오 품질 점검 보고서",
-    "제어 문자는 [U+번호]로 표시합니다. 원본 값은 CSV에서 확인하세요.",
+    "지원되지 않는 문자와 제어 문자는 [U+번호]로 표시합니다. 원본 값은 CSV에서 확인하세요.",
     ...rows.map(([name, value, extra]) => `${name}: ${value}${extra ? ` / ${extra}` : ""}`),
-  ].map(printableText);
+  ].map(text => printableText(text, supported));
   for (const text of texts) {
     for (const ch of text) {
       const cp = ch.codePointAt(0)!;

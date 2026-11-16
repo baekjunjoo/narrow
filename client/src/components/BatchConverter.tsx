@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine,
   AudioLines,
@@ -72,8 +72,9 @@ function shortenName(value: string, maxBytes: number): string {
 function outputName(
   file: File,
   format: AudioFormat,
-  items: BatchItem[]
-): string {
+  used: Set<string>,
+  next: Map<string, number>
+): { name: string; key: string; next: number } {
   const decoded = new TextDecoder().decode(
     new TextEncoder().encode(file.name.normalize("NFKC"))
   );
@@ -89,15 +90,11 @@ function outputName(
   base = shortenName(base, 160).replace(/[.\s]+$/u, "") || "오디오";
   // A separate suffix prevents a same-format result from having the input name.
   base += "_변환";
-  const used = new Set<string>();
-  for (const item of items) {
-    used.add(nameKey(item.file.name));
-    if (item.result) used.add(nameKey(item.result.name));
-  }
   let candidate = `${base}.${format}`;
-  let n = 2;
+  const key = nameKey(candidate);
+  let n = next.get(key) ?? 2;
   while (used.has(nameKey(candidate))) candidate = `${base} (${n++}).${format}`;
-  return candidate;
+  return { name: candidate, key, next: n };
 }
 
 function errorText(error: unknown): string {
@@ -108,6 +105,7 @@ function errorText(error: unknown): string {
 
 export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
   const [items, setItems] = useState<BatchItem[]>([]);
+  const [completedEntries, setCompletedEntries] = useState<ZipEntry[]>([]);
   const [format, setFormat] = useState<AudioFormat>("mp3");
   const [running, setRunning] = useState(false);
   const [zipBuilding, setZipBuilding] = useState<number | null>(null);
@@ -115,6 +113,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
   const [announcement, setAnnouncement] = useState("");
   const [fileAnnouncements, setFileAnnouncements] = useState<{ id: number; text: string }[]>([]);
   const itemsRef = useRef<BatchItem[]>([]);
+  const completedResults = useRef<BatchResult[]>([]);
   const nextId = useRef(1);
   const mounted = useRef(true);
   const operation = useRef(0);
@@ -127,7 +126,14 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
   const busyCallback = useRef(onBusyChange);
   const nextAnnouncement = useRef(0);
   const zipDownloadLink = useRef<HTMLAnchorElement | null>(null);
-  const returnZipFocus = useRef(false);
+  const zipCancelButton = useRef<HTMLButtonElement | null>(null);
+  const zipPrepareButtons = useRef(new Map<number, HTMLButtonElement>());
+  const fileInput = useRef<HTMLInputElement | null>(null);
+  const startButton = useRef<HTMLButtonElement | null>(null);
+  const stopButton = useRef<HTMLButtonElement | null>(null);
+  const removeCompletedButton = useRef<HTMLButtonElement | null>(null);
+  const removeButtons = useRef(new Map<number, HTMLButtonElement>());
+  const pendingFocus = useRef<{ origin: HTMLElement; target: () => HTMLElement | null } | null>(null);
   busyCallback.current = onBusyChange;
 
   // Keep the authoritative queue in a ref: callbacks and cancel handlers must not
@@ -135,8 +141,21 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
   const updateItems = (update: (current: BatchItem[]) => BatchItem[]) => {
     const next = update(itemsRef.current);
     itemsRef.current = next;
+    const results = next.flatMap(item => item.result ? [item.result] : []);
+    if (results.length !== completedResults.current.length || results.some((result, index) => result !== completedResults.current[index])) {
+      completedResults.current = results;
+      if (mounted.current) setCompletedEntries(results.map(result => ({ name: result.name, blob: result.blob })));
+    }
     if (mounted.current) setItems(next);
   };
+  const moveFocusFrom = (origin: HTMLElement | null, target: () => HTMLElement | null) => {
+    if (origin && document.activeElement === origin) pendingFocus.current = { origin, target };
+  };
+  useLayoutEffect(() => {
+    const pending = pendingFocus.current;
+    pendingFocus.current = null;
+    if (pending && (document.activeElement === pending.origin || document.activeElement === document.body)) pending.target()?.focus();
+  });
   const say = (message: string) => {
     if (mounted.current) setAnnouncement(message);
   };
@@ -225,13 +244,6 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
     };
   }, []);
 
-  useEffect(() => {
-    if (readyZip && returnZipFocus.current && document.activeElement === document.body) {
-      zipDownloadLink.current?.focus();
-    }
-    if (readyZip) returnZipFocus.current = false;
-  }, [readyZip]);
-
   const addFiles = (files: FileList | null) => {
     if (active.current || !files?.length) return;
     const selected = Array.from(files);
@@ -260,6 +272,9 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
     const item = itemsRef.current.find(entry => entry.id === id);
     if (!item) return;
     if (item.result && !window.confirm(`${item.result.name} 결과를 삭제할까요? 다운로드하지 않았다면 결과가 사라집니다.`)) return;
+    const index = itemsRef.current.findIndex(entry => entry.id === id);
+    const neighbor = itemsRef.current[index + 1] ?? itemsRef.current[index - 1];
+    moveFocusFrom(removeButtons.current.get(id) ?? null, () => (neighbor && removeButtons.current.get(neighbor.id)) || fileInput.current);
     clearReadyZip();
     if (item.result) URL.revokeObjectURL(item.result.url);
     updateItems(current => current.filter(entry => entry.id !== id));
@@ -271,13 +286,14 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
     const completed = itemsRef.current.filter(item => item.result);
     if (!completed.length) return;
     if (!window.confirm(`완료된 결과 ${completed.length}개를 목록에서 삭제할까요? 다운로드하지 않은 결과는 사라집니다.`)) return;
+    moveFocusFrom(removeCompletedButton.current, () => fileInput.current);
     clearReadyZip();
     for (const item of completed) URL.revokeObjectURL(item.result!.url);
     updateItems(current => current.filter(item => !item.result));
     say(`완료된 결과 ${completed.length}개를 목록에서 삭제했습니다.`);
   };
 
-  const runQueue = async (which: "waiting" | "failed") => {
+  const runQueue = async (which: "waiting" | "failed", origin: HTMLButtonElement) => {
     if (active.current || otherBusy) return;
     if (resultBytes(itemsRef.current) >= RESULT_LIMIT) {
       say(
@@ -289,9 +305,17 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
       .filter(item => item.state === which)
       .map(item => item.id);
     if (!targets.length) return;
+    moveFocusFrom(origin, () => stopButton.current ?? (origin.isConnected && !origin.disabled ? origin : fileInput.current));
     clearReadyZip();
     // Capture the format and target IDs once for this entire run.
     const runFormat = format;
+    // The queue is locked while converting, so this set only grows during a run.
+    const usedNames = new Set<string>();
+    for (const item of itemsRef.current) {
+      usedNames.add(nameKey(item.file.name));
+      if (item.result) usedNames.add(nameKey(item.result.name));
+    }
+    const nextSuffix = new Map<string, number>();
     const token = ++operation.current;
     active.current = "convert";
     setRunning(true);
@@ -362,7 +386,8 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
             }
           );
           if (!mounted.current || operation.current !== token) return;
-          const name = outputName(item.file, runFormat, itemsRef.current);
+          const allocated = outputName(item.file, runFormat, usedNames, nextSuffix);
+          const name = allocated.name;
           const url = URL.createObjectURL(result.blob);
           updateItems(current =>
             current.map(entry =>
@@ -376,6 +401,8 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
                 : entry
             )
           );
+          usedNames.add(nameKey(name));
+          nextSuffix.set(allocated.key, allocated.next);
           succeeded++;
           announceFile(`${item.file.name} 변환이 완료되었습니다.`);
         } catch (error) {
@@ -398,6 +425,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
       }
     } finally {
       if (mounted.current && operation.current === token) {
+        moveFocusFrom(stopButton.current, () => startButton.current && !startButton.current.disabled ? startButton.current : fileInput.current);
         active.current = null;
         setRunning(false);
         busyCallback.current(false);
@@ -416,6 +444,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
 
   const stop = () => {
     if (active.current !== "convert") return;
+    moveFocusFrom(stopButton.current, () => startButton.current && !startButton.current.disabled ? startButton.current : fileInput.current);
     operation.current++;
     engine.current?.dispose();
     engine.current = null;
@@ -437,13 +466,6 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
     say("변환을 중단했습니다. 현재 파일과 나머지 목록은 유지됩니다.");
   };
 
-  const completedEntries = useMemo<ZipEntry[]>(
-    () =>
-      items.flatMap(item =>
-        item.result ? [{ name: item.result.name, blob: item.result.blob }] : []
-      ),
-    [items]
-  );
   const zipGroups = useMemo(
     () => partitionZipEntries(completedEntries),
     [completedEntries]
@@ -455,13 +477,14 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
   const doneCount = completedEntries.length;
   const locked = running || zipBuilding !== null;
 
-  const prepareZip = async (groupIndex: number) => {
+  const prepareZip = async (groupIndex: number, origin: HTMLButtonElement) => {
     if (active.current || otherBusy) return;
     const entries = itemsRef.current.flatMap(item =>
       item.result ? [{ name: item.result.name, blob: item.result.blob }] : []
     );
     const group = partitionZipEntries(entries).groups[groupIndex];
     if (!group?.length) return;
+    moveFocusFrom(origin, () => zipCancelButton.current ?? zipDownloadLink.current ?? zipPrepareButtons.current.get(groupIndex) ?? fileInput.current);
     clearReadyZip();
     const token = ++operation.current;
     const controller = new AbortController();
@@ -485,13 +508,13 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
       );
     } catch (error) {
       if (mounted.current && token === operation.current) {
-        returnZipFocus.current = false;
         say(error instanceof DOMException && error.name === "AbortError"
           ? "ZIP 준비를 취소했습니다. 완료된 오디오 파일은 그대로 남아 있습니다."
           : `ZIP을 준비하지 못했습니다. ${errorText(error)}`);
       }
     } finally {
       if (mounted.current && token === operation.current) {
+        moveFocusFrom(zipCancelButton.current, () => zipDownloadLink.current ?? zipPrepareButtons.current.get(groupIndex) ?? fileInput.current);
         zipAbort.current = null;
         active.current = null;
         setZipBuilding(null);
@@ -509,6 +532,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
   const consumeZipLink = () => {
     const ready = readyZipRef.current;
     if (!ready) return;
+    moveFocusFrom(zipDownloadLink.current, () => zipPrepareButtons.current.get(ready.groupIndex) ?? fileInput.current);
     // Let the browser start the navigation before releasing the temporary URL.
     readyZipRef.current = null;
     setReadyZip(null);
@@ -585,6 +609,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
         <div className="batch-field batch-file-field">
           <label htmlFor="batch-files">오디오 파일 선택</label>
           <input
+            ref={fileInput}
             id="batch-files"
             type="file"
             multiple
@@ -618,9 +643,10 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
 
       <div className="batch-actions">
         <button
+          ref={startButton}
           className="batch-primary"
           type="button"
-          onClick={() => void runQueue("waiting")}
+          onClick={event => void runQueue("waiting", event.currentTarget)}
           disabled={locked || otherBusy || !waitingCount || atLimit}
         >
           {running ? (
@@ -639,13 +665,13 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
         <button
           className="batch-secondary"
           type="button"
-          onClick={() => void runQueue("failed")}
+          onClick={event => void runQueue("failed", event.currentTarget)}
           disabled={locked || otherBusy || !failedCount || atLimit}
         >
           실패한 항목 다시 시도
         </button>
         {running && (
-          <button className="batch-stop" type="button" onClick={stop}>
+          <button ref={stopButton} className="batch-stop" type="button" onClick={stop}>
             변환 중단
           </button>
         )}
@@ -686,7 +712,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
         <span>완료 결과 {sizeText(totalBytes)} / 256 MiB</span>
       </div>
       {doneCount > 0 && (
-        <button className="batch-remove" type="button" disabled={locked} onClick={removeCompleted}>
+        <button ref={removeCompletedButton} className="batch-remove" type="button" disabled={locked} onClick={removeCompleted}>
           <Trash2 size={15} aria-hidden="true" /> 완료 항목 모두 삭제
         </button>
       )}
@@ -757,6 +783,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
                   </a>
                 )}
                 <button
+                  ref={element => { if (element) removeButtons.current.set(item.id, element); else removeButtons.current.delete(item.id); }}
                   className="batch-remove"
                   type="button"
                   disabled={locked}
@@ -801,12 +828,12 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
                     </a>
                   ) : (
                     <button
+                      ref={element => { if (element) zipPrepareButtons.current.set(index, element); else zipPrepareButtons.current.delete(index); }}
                       className="batch-secondary"
                       type="button"
                       disabled={locked || otherBusy}
                       onClick={event => {
-                        returnZipFocus.current = document.activeElement === event.currentTarget;
-                        void prepareZip(index);
+                        void prepareZip(index, event.currentTarget);
                       }}
                     >
                       {zipBuilding === index
@@ -829,7 +856,7 @@ export default function BatchConverter({ otherBusy, onBusyChange }: Props) {
             ))}
           </div>
           {zipBuilding !== null && (
-            <button className="batch-stop" type="button" onClick={cancelZip}>ZIP 준비 취소</button>
+            <button ref={zipCancelButton} className="batch-stop" type="button" onClick={cancelZip}>ZIP 준비 취소</button>
           )}
           {zipGroups.tooLarge.length > 0 && (
             <div className="batch-large-notice">

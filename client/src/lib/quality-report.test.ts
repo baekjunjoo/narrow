@@ -77,9 +77,38 @@ describe("quality report CSV", () => {
 });
 
 describe("quality report PDF", () => {
-  it("refuses unsupported glyphs rather than silently losing report content", async () => {
-    await expect(createQualityPdf(completed(report(), "한글😀"), font)).rejects.toThrow(/U\+1F600.*CSV/);
-  });
+  it("explicitly represents unsupported label and issue characters without changing CSV", async () => {
+    const label = "한글😀 낭독👩‍🎤";
+    const input = completed(report({ issues: [{ level: "warning", message: "확인🫠" }] }), label);
+    const rows = parseCsv((await createQualityCsv(input).text()).replace(/^\uFEFF/, ""));
+    expect(rows.find(row => row[0] === "음원 라벨")?.[1]).toBe(label);
+    expect(rows.find(row => row[0] === "경고 1")?.[1]).toBe("확인🫠");
+    const blob = await createQualityPdf(input, font);
+    const path = join(temporary, "unsupported.pdf");
+    writeFileSync(path, new Uint8Array(await blob.arrayBuffer()));
+    const text = execFileSync("pdftotext", ["-raw", path, "-"], { encoding: "utf8" });
+    expect(text.replace(/\s/g, "")).toContain("한글[U+1F600]낭독[U+1F469][U+200D][U+1F3A4]");
+    for (const escape of ["[U+1F600]", "[U+1F469]", "[U+200D]", "[U+1F3A4]"]) expect(text).toContain(escape);
+    expect(text).toContain("확인[U+1FAE0]");
+    expect(text.replace(/\s/g, "")).toContain("원본값은CSV");
+  }, 60_000);
+  it("keeps each precise decimal and exponent together in extracted text", async () => {
+    const r = report({
+      duration: 2647.605442176871, peakDb: -6.020599913279624,
+      rmsDb: -6.025532628411997,
+      silentRegions: [{ start: 2644.6, end: 2647.605442176871 }],
+      issues: [{ level: "info", message: `작은 값 ${1.23456789012345e-100} 및 ${-1.23456789012345e-100}` }],
+    });
+    const blob = await createQualityPdf(completed(r), font);
+    const path = join(temporary, "numbers.pdf");
+    writeFileSync(path, new Uint8Array(await blob.arrayBuffer()));
+    for (const mode of ["-raw", "-layout"]) {
+      const text = execFileSync("pdftotext", [mode, path, "-"], { encoding: "utf8" });
+      for (const value of [r.duration, r.peakDb, r.rmsDb, r.silentRegions[0].start, r.silentRegions[0].end, 1.23456789012345e-100, -1.23456789012345e-100]) {
+        expect(text).toContain(String(value));
+      }
+    }
+  }, 60_000);
   it("embeds searchable Korean and retains every row, value and limit across pages", async () => {
     const warning = "긴경고시작" + "경고내용을확인하세요".repeat(280) + "긴경고끝";
     const spacedWarning = "3초 이상 지속된 저음량 또는 무음 의심 구간이 있습니다. 의도된 휴지나 배경음일 수 있으니 청취해 확인해 주세요.";
@@ -95,7 +124,7 @@ describe("quality report PDF", () => {
     const compact = text.replace(/\s/g, "");
     const expected = [
       "오디오 품질 점검 보고서",
-      "제어 문자는 [U+번호]로 표시합니다. 원본 값은 CSV에서 확인하세요.",
+      "지원되지 않는 문자와 제어 문자는 [U+번호]로 표시합니다. 원본 값은 CSV에서 확인하세요.",
       ...qualityReportRows(completed(r)).map(([name, value, extra]) => `${name}: ${value}${extra ? ` / ${extra}` : ""}`),
     ].join("").replace(/\s/g, "");
     // Ignore line/page wrapping only: compare all row names, values and extra

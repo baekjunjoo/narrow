@@ -111,7 +111,7 @@ def main():
                 write_private(directory / f'screen-{i}.png', png)
         write_private(directory / 'web-controls.json', json.dumps(all_controls, ensure_ascii=False, indent=2) + '\n')
         write_private(directory / 'keyboard-focus.json', json.dumps(focus_trace, ensure_ascii=False, indent=2) + '\n')
-        expected = [('예시 원고 버튼', 'Button', '예시 원고'), ('TXT 불러오기 버튼', 'Button', 'TXT 불러오기'),
+        expected = [('예시 원고 버튼', 'Button', '예시 원고'), ('파일 불러오기 버튼', 'Button', '파일 불러오기'),
                     ('오디오 만들기 버튼', 'Button', '오디오 만들기'), ('원고 입력', 'EditText', '원고'),
                     ('파일 선택', 'Button', '오디오 파일'), ('형식 선택', 'Spinner', '결과 형식')]
         found = 0

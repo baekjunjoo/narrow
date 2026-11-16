@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import type LibAVTypes from '@libav.js/variant-obsolete';
 import { AudioQualityAnalyzer } from './audio-quality';
 import { inspectAudioFile } from './audio-quality-file';
-import { QualityAccumulator } from './audio-quality-stats';
+import { QualityAccumulator, sourceS32BitDepth } from './audio-quality-stats';
 
 const frame = (format: number, data: unknown, nb_samples: number) => ({ format, data, nb_samples }) as LibAVTypes.Frame;
 const report = () => ({ duration: 1, channels: 1, sampleRate: 10, peakDb: -6, rmsDb: -9, silentRegions: [], issues: [] });
@@ -96,6 +96,45 @@ describe('streaming statistics', () => {
     const b = new QualityAccumulator(100, 1); b.add(frame(1, new Int16Array([32767, 32767]), 2)); b.add(frame(1, new Int16Array([32767]), 1));
     expect(b.finish().issues.some(x => x.message.includes('클리핑 의심'))).toBe(true);
   });
+  it('uses a confirmed 24-bit source limit for S32 while keeping negative and isolated peaks distinct', () => {
+    const clipped = (values: number[], bits: 24 | null = 24) => {
+      const a = new QualityAccumulator(100, 1, bits);
+      a.add(frame(2, new Int32Array(values.slice(0, 2)), 2));
+      a.add(frame(2, new Int32Array(values.slice(2)), values.length - 2));
+      return a.finish().issues.some(x => x.message.includes('클리핑 의심'));
+    };
+    expect(clipped([2147483392, 2147483392, 2147483392])).toBe(true);
+    expect(clipped([-2147483648, -2147483648, -2147483648])).toBe(true);
+    expect(clipped([0, 2147483392, 0])).toBe(false);
+    expect(clipped([-2147483392, -2147483392, -2147483392])).toBe(false);
+    expect(clipped([2147483136, 2147483136, 2147483136])).toBe(false);
+    expect(clipped([2147483392, 2147483392, 2147483392], null)).toBe(false);
+    expect(clipped([-2147483648, 2147483392, -2147483648])).toBe(false);
+  });
+  it('keeps 24-bit clip runs per channel for planar stereo', () => {
+    const a = new QualityAccumulator(100, 2, 24);
+    a.add(frame(7, [new Int32Array([2147483392, 2147483392, 2147483392]), new Int32Array([0, 0, 0])], 3));
+    expect(a.finish().issues.some(x => x.message.includes('클리핑 의심'))).toBe(true);
+    const b = new QualityAccumulator(100, 2, 24);
+    b.add(frame(7, [new Int32Array([2147483392, 0, 2147483392]), new Int32Array([0, 2147483392, 0])], 3));
+    expect(b.finish().issues.some(x => x.message.includes('클리핑 의심'))).toBe(false);
+  });
+  it('warns for unknown source depth only when a packed or planar S32 frame is actually observed', () => {
+    const limitation = (a: QualityAccumulator) => a.finish().issues.filter(x => x.level === 'warning' && /S32.*24비트.*양의.*놓칠/.test(x.message));
+    for (const [format, data] of [[2, new Int32Array(3)], [7, [new Int32Array(3)]]] as const) {
+      const a = new QualityAccumulator(100, 1);
+      a.add(frame(format, data, 3)); a.add(frame(format, data, 3));
+      expect(limitation(a)).toHaveLength(1);
+      const known = new QualityAccumulator(100, 1, 24); known.add(frame(format, data, 3));
+      expect(limitation(known)).toHaveLength(0);
+      const knownOther = new QualityAccumulator(100, 1, 'other'); knownOther.add(frame(format, data, 3));
+      expect(limitation(knownOther)).toHaveLength(0);
+    }
+    for (const [format, data] of [[1, new Int16Array(3)], [3, new Float32Array(3)], [8, [new Float32Array(3)]]] as const) {
+      const a = new QualityAccumulator(100, 1); a.add(frame(format, data, 3));
+      expect(limitation(a)).toHaveLength(0);
+    }
+  });
   it.each([NaN, Infinity, -Infinity])('rejects non-finite sample %s', sample => {
     const a = new QualityAccumulator(100, 1); expect(() => a.add(frame(3, new Float32Array([sample]), 1))).toThrow('NaN 또는 Infinity');
   });
@@ -123,6 +162,41 @@ function wav(samples = 100): Blob {
   return new Blob([b]);
 }
 describe('bounded file inspection', () => {
+  it('confirms 24 bits from WAV PCM and FLAC STREAMINFO, not float, 32-bit or malformed headers', async () => {
+    const b = new Uint8Array(await wav(99).arrayBuffer());
+    const v = new DataView(b.buffer);
+    v.setUint16(32, 3, true); v.setUint16(34, 24, true);
+    expect(await sourceS32BitDepth(new Blob([b]), 'wav')).toBe(24);
+    v.setUint16(34, 32, true);
+    expect(await sourceS32BitDepth(new Blob([b]), 'wav')).toBeNull();
+    v.setUint16(32, 4, true);
+    expect(await sourceS32BitDepth(new Blob([b]), 'wav')).toBe('other');
+    v.setUint16(32, 3, true);
+    v.setUint16(34, 24, true); v.setUint16(20, 3, true);
+    expect(await sourceS32BitDepth(new Blob([b]), 'wav')).toBeNull();
+    const flac = new Uint8Array(42); flac.set(new TextEncoder().encode('fLaC')); flac[7] = 34;
+    flac[20] = 1; flac[21] = 0x70; // 24-bit STREAMINFO
+    expect(await sourceS32BitDepth(new Blob([flac]), 'flac')).toBe(24);
+    flac[21] = 0xf0; // 32-bit STREAMINFO
+    expect(await sourceS32BitDepth(new Blob([flac]), 'flac')).toBe('other');
+    expect(await sourceS32BitDepth(new Blob([flac.slice(0, 21)]), 'flac')).toBeNull();
+    expect(await sourceS32BitDepth(new Blob([b]), 'mp3')).toBe('other');
+  });
+  it('accepts only unambiguous 24-bit PCM extensible WAV metadata', async () => {
+    const b = new Uint8Array(68 + 6), v = new DataView(b.buffer);
+    const put = (at: number, s: string) => b.set(new TextEncoder().encode(s), at);
+    put(0, 'RIFF'); v.setUint32(4, b.length - 8, true); put(8, 'WAVE'); put(12, 'fmt '); v.setUint32(16, 40, true);
+    v.setUint16(20, 0xfffe, true); v.setUint16(22, 1, true); v.setUint16(32, 3, true); v.setUint16(34, 24, true);
+    v.setUint16(36, 22, true); v.setUint16(38, 24, true); v.setUint32(44, 1, true); v.setUint16(50, 0x10, true);
+    b.set([0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71], 52); put(60, 'data'); v.setUint32(64, 6, true);
+    expect(await sourceS32BitDepth(new Blob([b]), 'wav')).toBe(24);
+    v.setUint16(38, 20, true); expect(await sourceS32BitDepth(new Blob([b]), 'wav')).toBe('other');
+    v.setUint16(38, 24, true); v.setUint32(44, 3, true); expect(await sourceS32BitDepth(new Blob([b]), 'wav')).toBeNull();
+    v.setUint32(44, 1, true);
+    const duplicate = new Uint8Array(b.length + 48); duplicate.set(b); duplicate.set(b.slice(12, 60), b.length);
+    new DataView(duplicate.buffer).setUint32(4, duplicate.length - 8, true);
+    expect(await sourceS32BitDepth(new Blob([duplicate]), 'wav')).toBeNull();
+  });
   it('identifies WAV by signature and reads declared PCM sample count', async () => { expect(await inspectAudioFile(wav(100))).toMatchObject({ format: 'wav', samples: 100 }); });
   it('rejects truncated RIFF and a data chunk extending beyond RIFF', async () => {
     const file = wav(100); await expect(inspectAudioFile(file.slice(0, file.size - 2))).rejects.toThrow('잘렸');
@@ -145,6 +219,9 @@ describe('bounded file inspection', () => {
     const large = { size: 200 * 1024 * 1024, slice } as unknown as Blob;
     expect(await inspectAudioFile(large)).toMatchObject({ format: 'wav', samples: 100 });
     expect(Math.max(...slice.mock.calls.map(([start, end]) => end - start))).toBeLessThanOrEqual(16);
+    slice.mockClear();
+    expect(await sourceS32BitDepth(large, 'wav')).toBe('other');
+    expect(Math.max(...slice.mock.calls.map(([start, end]) => end - start))).toBeLessThanOrEqual(40);
   });
   it('does not perform network I/O on source audio', () => {
     const worker = readFileSync(new URL('./audio-quality.worker.ts', import.meta.url), 'utf8');
@@ -153,5 +230,10 @@ describe('bounded file inspection', () => {
     expect(worker + modules.join('\n')).not.toMatch(/\b(fetch|XMLHttpRequest|WebSocket|sendBeacon)\s*\(/);
     expect(worker).toContain('base.origin !== self.location.origin');
     expect(worker).toContain("mkreadaheadfile('quality-input', blob)");
+  });
+  it('describes the MP3 short status without asserting a large decoded-audio shortfall', () => {
+    const worker = readFileSync(new URL('./audio-quality.worker.ts', import.meta.url), 'utf8');
+    expect(worker).not.toContain('디코딩된 오디오가 크게 부족');
+    expect(worker).toMatch(/MP3.*바이트.*길이.*불일치/);
   });
 });

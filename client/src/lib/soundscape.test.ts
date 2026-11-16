@@ -38,6 +38,8 @@ let renderedRightLevel = 0.1;
 let voiceTailSilence = false;
 let hrtfFailure: 'none' | 'create' | 'configure' = 'none';
 let stereoFailure = false;
+let assetDecodeFailure = 0;
+let decodedAssetIds: number[] = [];
 
 class FakeBuffer {
   sampleRate = 44_100;
@@ -94,8 +96,13 @@ class FakeAudioContext {
   decodeCount = 0;
   closed = false;
   constructor() { decoderInstances.push(this); }
-  async decodeAudioData() {
+  async decodeAudioData(bytes: ArrayBuffer) {
     const isVoice = this.decodeCount++ === 0;
+    if (!isVoice) {
+      const id = new Uint8Array(bytes)[0];
+      decodedAssetIds.push(id);
+      if (id === assetDecodeFailure && id !== 0) throw new Error('bad encoded asset');
+    }
     const result = new FakeBuffer(isVoice ? voiceDuration : 4, isVoice ? 1 : assetChannels);
     if (isVoice) {
       result.sampleRate = 1000;
@@ -197,6 +204,8 @@ beforeEach(() => {
   voiceTailSilence = false;
   hrtfFailure = 'none';
   stereoFailure = false;
+  assetDecodeFailure = 0;
+  decodedAssetIds = [];
   offlineInstances = [];
   decoderInstances = [];
   encoded.settings.length = 0;
@@ -266,6 +275,19 @@ describe('mixSoundscape', () => {
     ['비가 안 멈췄다.', '빗소리'],
     ['비가 내릴 것 같았다.', '빗소리'],
     ['문을 열고 싶었다.', '문 여닫는 소리'],
+    ['It will rain.', '빗소리'],
+    ['The rain will not stop.', '빗소리'],
+    ["The rain won't stop.", '빗소리'],
+    ["It won't stop raining.", '빗소리'],
+    ['It will not stop raining.', '빗소리'],
+    ['The rain cannot stop.', '빗소리'],
+    ['It cannot stop raining.', '빗소리'],
+    ['It did not not rain.', '빗소리'],
+    ["It didn't not rain.", '빗소리'],
+    ['비가 내리지 않은 것은 아니었다.', '빗소리'],
+    ['문을 열지 않은 것은 아니었다.', '문 여닫는 소리'],
+    ['문을 열려고 했다.', '문 여닫는 소리'],
+    ['문을 열려고 하지 않은 것은 아니었다.', '문 여닫는 소리'],
   ])('recognizes the positive cue %s', async (text, label) => {
     const result = await mixSoundscape(voice(), [cue(text)], options);
     expect(result.events.map((event) => event.label)).toEqual([label]);
@@ -314,6 +336,10 @@ describe('mixSoundscape', () => {
     '그는 안 걸었다.',
     '그는 문을 안 열었다.',
     '그는 문을 열지 않았다.',
+    '문을 열려고 하지 않았다.',
+    '문을 열려고는 하지 않았다.',
+    '문을 열려고 하지도 않았다.',
+    '그녀는 책장을 넘기려고 하지 않았다.',
     '문을 열고 싶지 않았다.',
     '문을 열고 싶지는 않았다.',
     '문을 열 수 없었다.',
@@ -321,6 +347,14 @@ describe('mixSoundscape', () => {
     '책장을 넘기지 못했다.',
     'There was no downpour.',
     'It did not rain.',
+    "It won't rain.",
+    'It won’t rain.',
+    'It will not rain.',
+    'It cannot rain.',
+    "The rain won't fall.",
+    'The rain cannot fall.',
+    "She won't open the door.",
+    'She cannot open the door.',
     'It has not yet rained.',
     "It hasn't yet rained.",
     'The rain had not yet fallen.',
@@ -462,7 +496,7 @@ describe('mixSoundscape', () => {
     expect(result.events[1].time).toBeLessThan(12);
     expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
     expect(result.blob.type).toBe('audio/mpeg');
-    expect(result.warnings).toEqual([]);
+    expect(result.warnings).toEqual(['음향 간격·반복 제한으로 효과음 단서 2개를 생략했습니다. 서로 다른 사건도 포함될 수 있습니다.']);
   });
 
   it('allows one background and one action to overlap, without stacking nearby actions', async () => {
@@ -470,6 +504,42 @@ describe('mixSoundscape', () => {
       cue('비가', 0), cue('문을 열었다', 3), cue('발소리가', 6), cue('숲에', 7),
     ], options);
     expect(result.events.map((event) => event.label)).toEqual(['빗소리', '문 여닫는 소리', '숲']);
+  });
+
+  it.each([
+    [[cue('문을 열었다.', 0, 2), cue('책장을 넘겼다.', 4, 2)], '문 여닫는 소리'],
+    [[cue('문을 열었다.', 0, 2), cue('문을 닫았다.', 15, 2)], '문 여닫는 소리'],
+    [[cue('비가 내렸다.', 0, 2), cue('비가 내렸다.', 20, 2)], '빗소리'],
+  ])('reports when conservative density rules omit even separate non-overlapping candidates', async (cues, label) => {
+    const result = await mixSoundscape(voice(), cues, options);
+    expect(result.events.map((event) => event.label)).toEqual([label]);
+    expect(result.warnings.join(' ')).toContain('효과음 단서 1개');
+    expect(result.warnings.join(' ')).toContain('생략');
+  });
+
+  it('keeps overlap and crowding limits and reports the exact omitted candidate count', async () => {
+    const result = await mixSoundscape(voice(), [
+      cue('비가', 0, 2), cue('문을 열었다', 1, 2), cue('문을 열었다', 3, 2),
+      cue('책장을 넘겼다', 7, 2), cue('바다에서', 9, 2),
+    ], options);
+    expect(result.events.map((event) => event.label)).toEqual(['빗소리', '문 여닫는 소리', '바다']);
+    expect(result.warnings.join(' ')).toContain('효과음 단서 2개');
+    const sources = offlineInstances[0].sources.slice(1);
+    expect(sources[0].stopTime).toBeGreaterThan(sources[1].startTime); // ambient + action allowed
+    for (let i = 1; i < sources.length; i++) expect(sources[i].startTime - sources[i - 1].startTime).toBeGreaterThanOrEqual(2);
+  });
+
+  it('allows independent groups to overlap but not effects in the same group', async () => {
+    const result = await mixSoundscape(voice(), [
+      cue('비가', 0, 2), cue('문을 열었다', 3, 2), cue('바다에서', 7, 2), cue('책장을 넘겼다', 10, 2),
+    ], options);
+    expect(result.events.map((event) => event.label)).toEqual(['빗소리', '문 여닫는 소리', '바다', '책장 넘기는 소리']);
+    expect(result.warnings).toEqual([]);
+    const [rain, door, ocean, page] = offlineInstances[0].sources.slice(1);
+    expect(rain.stopTime).toBeGreaterThan(door.startTime);
+    expect(ocean.stopTime).toBeGreaterThan(page.startTime);
+    expect(rain.stopTime).toBeLessThanOrEqual(ocean.startTime);
+    expect(door.stopTime).toBeLessThanOrEqual(page.startTime);
   });
 
   it('moves a final action earlier within its cue when needed to leave audible output', async () => {
@@ -681,6 +751,86 @@ describe('mixSoundscape', () => {
     expect(decoderInstances[0].closed).toBe(true);
   });
 
+  it('fetches and consumes all effect responses but decodes only needed assets', async () => {
+    const reads: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({
+      ok: true,
+      arrayBuffer: async () => {
+        reads.push(url);
+        return new Uint8Array([effectUrls.indexOf(url) + 1]).buffer;
+      },
+    })));
+    assetDecodeFailure = 6; // A broken page must not affect rain or a music-only mix.
+    const rain = await mixSoundscape(voice(), [cue('rain')], options);
+    expect(rain.events.map((event) => event.label)).toEqual(['빗소리']);
+    expect(decodedAssetIds).toEqual([1]);
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+    expect(reads).toEqual(effectUrls);
+    decodedAssetIds = [];
+    reads.length = 0;
+    vi.mocked(fetch).mockClear();
+    const none = await mixSoundscape(voice(), [], options);
+    expect(none.events).toEqual([]);
+    expect(decodedAssetIds).toEqual([]);
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+    expect(reads).toEqual(effectUrls);
+  });
+
+  it('ignores unused fetch failures while retaining music, and completes identical requests before required failures', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => url.endsWith('/page.mp3')
+      ? { ok: false, status: 404 }
+      : { ok: true, arrayBuffer: async () => new ArrayBuffer(1) }));
+    const mixed = await mixSoundscape(voice(), [cue('rain')], { ...options, music: true });
+    expect(mixed.events.map((event) => event.label)).toEqual(['빗소리']);
+    expect(offlineInstances[0].sources).toHaveLength(3); // voice, music, rain
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(['/soundscape/music-calm.mp3', ...effectUrls]);
+    vi.mocked(fetch).mockClear();
+    await expect(mixSoundscape(voice(), [cue('책장을 넘겼다')], { ...options, music: true }))
+      .rejects.toThrow('/soundscape/tinyaudio-v1/page.mp3');
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(['/soundscape/music-calm.mp3', ...effectUrls]);
+    expect(decoderInstances[1].closed).toBe(true);
+  });
+
+  it('completes all fixed requests before reporting a required effect or music failure', async () => {
+    for (const failed of ['/soundscape/tinyaudio-v1/rain.mp3', '/soundscape/music-calm.mp3']) {
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => url === failed
+        ? { ok: false, status: 503 }
+        : { ok: true, arrayBuffer: async () => new ArrayBuffer(1) }));
+      await expect(mixSoundscape(voice(), [cue('rain')], { ...options, music: true })).rejects.toThrow(failed);
+      expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(['/soundscape/music-calm.mp3', ...effectUrls]);
+    }
+  });
+
+  it('ignores unused body-read errors but reports a required body-read error after every request', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({
+      ok: true,
+      arrayBuffer: async () => {
+        if (url.endsWith('/page.mp3')) throw new Error('body interrupted');
+        return new ArrayBuffer(1);
+      },
+    })));
+    const result = await mixSoundscape(voice(), [cue('rain')], { ...options, music: true });
+    expect(result.events.map((event) => event.label)).toEqual(['빗소리']);
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(['/soundscape/music-calm.mp3', ...effectUrls]);
+    vi.mocked(fetch).mockClear();
+    await expect(mixSoundscape(voice(), [cue('책장을 넘겼다')], { ...options, music: true })).rejects.toThrow('body interrupted');
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(['/soundscape/music-calm.mp3', ...effectUrls]);
+  });
+
+  it('reports a required decode failure only after all fixed network requests', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({
+      ok: true, arrayBuffer: async () => new Uint8Array([effectUrls.indexOf(url) + 1]).buffer,
+    })));
+    assetDecodeFailure = 1;
+    const original = voice();
+    const before = Array.from(new Uint8Array(await original.arrayBuffer()));
+    await expect(mixSoundscape(original, [cue('rain')], options)).rejects.toThrow('디코딩하지 못했습니다');
+    expect(Array.from(new Uint8Array(await original.arrayBuffer()))).toEqual(before);
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+    expect(decoderInstances[0].closed).toBe(true);
+    expect(offlineInstances).toHaveLength(0);
+  });
+
   it('rejects invalid volume settings before starting audio', async () => {
     await expect(mixSoundscape(voice(), [], { ...options, musicVolume: 1.2 })).rejects.toThrow('0에서 1');
     expect(decoderInstances).toHaveLength(0);
@@ -705,7 +855,7 @@ describe('mixSoundscape', () => {
   it.each(['voice', 'asset'] as const)('waits for the physical %s decode after cancellation', async (kind) => {
     pendingDecode = kind;
     const controller = new AbortController();
-    const mixing = mixSoundscape(voice(), [], options, undefined, controller.signal);
+    const mixing = mixSoundscape(voice(), [cue('rain')], options, undefined, controller.signal);
     await vi.waitFor(() => expect(pendingDecodes).toHaveLength(1));
     controller.abort();
     await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });

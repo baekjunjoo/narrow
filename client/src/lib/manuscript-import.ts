@@ -14,6 +14,7 @@ const LIMIT_ERROR = "문서가 너무 복잡하거나 내용이 너무 많아 �
 const PDF_ERROR = "PDF가 손상되었거나 암호화되어 열 수 없습니다.";
 const DOCX_ERROR = "DOCX가 손상되었거나 암호화되어 열 수 없습니다.";
 const EMPTY_ERROR = "추출할 텍스트가 없습니다. 내용이 있는 파일을 선택해 주세요.";
+const EMPTY_MATH_ERROR = "추출할 본문 텍스트가 없습니다. DOCX 수식(OMML)은 추출하지 않으므로 원본을 확인해 주세요.";
 
 class ImportLimitError extends Error {
   constructor(message = LIMIT_ERROR) { super(message); this.name = "ImportLimitError"; }
@@ -63,6 +64,10 @@ async function extractPdf(bytes: ArrayBuffer): Promise<{ text: string; warnings:
       data: new Uint8Array(bytes),
       worker,
       useWorkerFetch: false,
+      // Built-in Adobe CMaps are local static assets, not document URLs. Vite's
+      // base is essential when the application is hosted under a project path.
+      cMapUrl: new URL(`${import.meta.env.BASE_URL}cmaps/`, window.location.href).href,
+      cMapPacked: true,
       useWasm: false,
       disableFontFace: true,
       isOffscreenCanvasSupported: false,
@@ -146,6 +151,18 @@ async function readPdf(task: import("pdfjs-dist").PDFDocumentLoadingTask): Promi
   return { text, warnings };
 }
 
+// CRC-32/ISO-HDLC (the checksum used in ZIP central directories).
+const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, index) => {
+  let crc = index;
+  for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  return crc >>> 0;
+});
+export function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (let index = 0; index < bytes.length; index++) crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ bytes[index]) & 0xff];
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
 // Only the document body is inflated. Other ZIP entries (images, relationships,
 // embedded content) are never unpacked or interpreted. ZIP64/multi-disk archives
 // are intentionally unsupported under these resource limits.
@@ -211,18 +228,17 @@ async function readDocxBody(bytes: Uint8Array): Promise<Uint8Array> {
     for (const chunk of chunks) { result.set(chunk, cursor); cursor += chunk.length; }
   }
   // Verify integrity even for stored entries and streams that otherwise decode.
-  let crc = 0xffffffff;
-  for (const byte of result) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
-  }
-  if (((crc ^ 0xffffffff) >>> 0) !== body.crc) throw new Error(DOCX_ERROR);
+  if (crc32(result) !== body.crc) throw new Error(DOCX_ERROR);
   return result;
 }
 
 const WORD_NAMESPACES = new Set([
   "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
   "http://purl.oclc.org/ooxml/wordprocessingml/main",
+]);
+const MATH_NAMESPACES = new Set([
+  "http://schemas.openxmlformats.org/officeDocument/2006/math",
+  "http://purl.oclc.org/ooxml/officeDocument/math",
 ]);
 
 async function extractDocx(bytes: ArrayBuffer): Promise<{ text: string; warnings: string[] }> {
@@ -244,11 +260,17 @@ async function extractDocx(bytes: ArrayBuffer): Promise<{ text: string; warnings
     if (bodies.length !== 1) throw new Error(DOCX_ERROR);
     const paragraphs: string[] = [];
     let total = 0;
-    const skip = new Set(["drawing", "pict", "object", "del", "moveFrom"]);
+    let hasMath = false;
+    const skip = new Set(["drawing", "pict", "object", "del", "moveFrom", "pPr"]);
     const visit = (element: Element, paragraph?: string[]) => {
       const isWord = WORD_NAMESPACES.has(element.namespaceURI ?? "");
       const name = element.localName;
       if (isWord && skip.has(name)) return;
+      if (MATH_NAMESPACES.has(element.namespaceURI ?? "") && (name === "oMath" || name === "oMathPara")) {
+        // Linearizing OMML as ordinary text can change the mathematical meaning.
+        hasMath = true;
+        return;
+      }
       if (isWord && name === "p") {
         const pieces: string[] = [];
         for (const child of Array.from(element.children)) visit(child, pieces);
@@ -263,17 +285,28 @@ async function extractDocx(bytes: ArrayBuffer): Promise<{ text: string; warnings
           paragraph.push(text);
           return;
         }
-        if (name === "tab") { paragraph.push("\t"); return; }
-        if (name === "br" || name === "cr") { paragraph.push("\n"); return; }
+        // These are run content only; e.g. w:pPr/w:tabs/w:tab defines a tab stop.
+        const parent = element.parentElement;
+        if (parent && WORD_NAMESPACES.has(parent.namespaceURI ?? "") && parent.localName === "r") {
+          if (name === "tab") { paragraph.push("\t"); return; }
+          if (name === "br" || name === "cr") { paragraph.push("\n"); return; }
+          if (name === "noBreakHyphen") { paragraph.push("\u2011"); return; }
+          if (name === "softHyphen") { paragraph.push("\u00ad"); return; }
+        }
       }
       for (const child of Array.from(element.children)) visit(child, paragraph);
     };
     visit(bodies[0]);
     const text = paragraphs.join("\n");
-    if (!text.trim()) throw new Error(EMPTY_ERROR);
-    return { text, warnings: ["DOCX 본문의 단락과 문자를 추출했습니다. 머리글·바닥글·각주, 그림과 표 또는 복잡한 서식은 누락되거나 원본과 다르게 표시될 수 있습니다."] };
+    if (!text.trim()) throw new Error(hasMath ? EMPTY_MATH_ERROR : EMPTY_ERROR);
+    const warnings = [
+      "DOCX 본문의 단락과 문자를 추출했습니다. 머리글·바닥글·각주, 그림과 표 또는 복잡한 서식은 누락되거나 원본과 다르게 표시될 수 있습니다.",
+      "목록의 자동 번호와 글머리표는 추출되지 않거나 원본과 다를 수 있습니다. 원본을 확인해 주세요.",
+    ];
+    if (hasMath) warnings.push("DOCX 수식(OMML)은 추출하지 않아 누락됩니다. 원본 수식을 확인해 주세요.");
+    return { text, warnings };
   } catch (error) {
-    if (error instanceof ImportLimitError || (error instanceof Error && error.message === EMPTY_ERROR)) throw error;
+    if (error instanceof ImportLimitError || (error instanceof Error && (error.message === EMPTY_ERROR || error.message === EMPTY_MATH_ERROR))) throw error;
     throw new Error(DOCX_ERROR);
   }
 }

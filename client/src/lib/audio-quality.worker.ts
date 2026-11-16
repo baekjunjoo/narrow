@@ -2,7 +2,7 @@ import type LibAVTypes from '@libav.js/variant-obsolete';
 import type { QualityReport } from './audio-quality';
 import { inspectAudioFile } from './audio-quality-file';
 import { mp3LengthStatus } from './audio-quality-length';
-import { QualityAccumulator } from './audio-quality-stats';
+import { QualityAccumulator, sourceS32BitDepth } from './audio-quality-stats';
 
 type Request = { type: 'analyze'; blob: Blob; assetBase: string };
 const READ_LIMIT = 32 * 1024;
@@ -15,6 +15,7 @@ async function analyze(request: Request): Promise<QualityReport> {
   if (!(blob instanceof Blob) || !blob.size) throw new Error('검사할 오디오 파일이 비어 있습니다.');
   progress('파일 형식과 선언된 길이를 확인하고 있습니다.');
   const inspection = await inspectAudioFile(blob);
+  const sourceBits = await sourceS32BitDepth(blob, inspection.format);
   const base = new URL(assetBase);
   if (base.origin !== self.location.origin) throw new Error('검사 라이브러리를 안전하게 불러올 수 없습니다.');
   progress('로컬 오디오 검사기를 준비하고 있습니다.');
@@ -39,7 +40,7 @@ async function analyze(request: Request): Promise<QualityReport> {
     const originalLayout = await libav.AVCodecParameters_channel_layoutmask(stream.codecpar);
     if (channels === 2 && originalLayout && originalLayout !== 3) throw new Error('일반적인 좌우 스테레오가 아닌 채널 배치는 검사할 수 없습니다.');
     [, dc, dp, df] = await libav.ff_init_decoder(stream.codec_id, { codecpar: stream.codecpar, time_base: [stream.time_base_num, stream.time_base_den] });
-    const stats = new QualityAccumulator(sampleRate, channels);
+    const stats = new QualityAccumulator(sampleRate, channels, sourceBits);
     let samples = 0, mp3Int16 = false, emptyReads = 0, packetCount = 0;
     const consume = (frames: LibAVTypes.Frame[]) => {
       for (const frame of frames) {
@@ -78,7 +79,7 @@ async function analyze(request: Request): Promise<QualityReport> {
     for (const message of inspection.warnings) result.issues.push({ level: 'warning', message });
     if (inspection.format === 'mp3') {
       const status = mp3LengthStatus(inspection.mp3, samples, sampleRate);
-      if (status === 'short') throw new Error('MP3가 잘렸거나 손상되어 선언된 길이보다 디코딩된 오디오가 크게 부족합니다.');
+      if (status === 'short') throw new Error('MP3가 잘렸거나 손상되었을 수 있습니다. 선언된 바이트 수 또는 오디오 길이가 실제 파일 또는 디코딩 결과와 불일치합니다.');
       if (status === 'unknown') result.issues.push({ level: 'warning', message: 'MP3의 신뢰할 수 있는 선언 길이가 없거나 너무 짧아 원본 전체 길이를 검증할 수 없습니다.' });
       else result.issues.push({ level: 'info', message: 'MP3 선언 프레임 수와 디코딩 길이를 지연·패딩 허용 오차 내에서 비교했습니다. 모든 손상을 검출하는 검사는 아닙니다.' });
       if (mp3Int16) result.issues.push({ level: 'warning', message: 'MP3 디코더가 16비트 정수 샘플을 반환해 피크가 이미 포화되었을 수 있습니다. 원본의 true peak나 확정적인 클리핑 여부는 알 수 없습니다.' });

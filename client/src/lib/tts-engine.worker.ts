@@ -10,11 +10,12 @@ const ROOT = 'https://huggingface.co/supertone-oss-archive/supertonic-3/resolve/
 const CACHE_NAME = 'narravo-supertonic3-aafc6e32416a';
 const STEPS = 8;
 const SILENCE_SECONDS = 0.3;
+// Git LFS SHA-256 oids for the pinned ROOT revision, not hashes from the cache itself.
 const MODEL_FILES = [
-  { name: 'duration_predictor', size: 3_700_147 },
-  { name: 'text_encoder', size: 36_416_150 },
-  { name: 'vector_estimator', size: 256_534_781 },
-  { name: 'vocoder', size: 101_424_195 },
+  { name: 'duration_predictor', size: 3_700_147, sha256: 'c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db' },
+  { name: 'text_encoder', size: 36_416_150, sha256: 'c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff' },
+  { name: 'vector_estimator', size: 256_534_781, sha256: '883ac868ea0275ef0e991524dc64f16b3c0376efd7c320af6b53f5b780d7c61c' },
+  { name: 'vocoder', size: 101_424_195, sha256: '085de76dd8e8d5836d6ca66826601f615939218f90e519f70ee8a36ed2a4c4ba' },
 ] as const;
 const TOTAL_MODEL_BYTES = MODEL_FILES.reduce((sum, model) => sum + model.size, 0);
 
@@ -40,12 +41,12 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-async function cachedFetch(path: string): Promise<Response> {
+async function cachedFetch(path: string, bypassCache = false): Promise<Response> {
   const url = `${ROOT}/${path}`;
   // Cache Storage is optional (private browsing, storage quota and policy can disable it).
   let cache: Cache | undefined;
   try { cache = await caches.open(CACHE_NAME); } catch { /* fall back to HTTP cache */ }
-  if (cache) {
+  if (cache && !bypassCache) {
     try {
       const hit = await cache.match(url);
       if (hit) return hit;
@@ -55,7 +56,7 @@ async function cachedFetch(path: string): Promise<Response> {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       // Allow slow connections enough time to download the 245 MiB largest file.
-      const response = await fetch(url, { mode: 'cors', credentials: 'omit', cache: 'force-cache', signal: AbortSignal.timeout(1_800_000) });
+      const response = await fetch(url, { mode: 'cors', credentials: 'omit', cache: bypassCache ? 'reload' : 'force-cache', signal: AbortSignal.timeout(1_800_000) });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       if (cache) {
         // Stream a clone into disk cache while the caller consumes the response. Quota
@@ -96,13 +97,13 @@ async function jsonFile<T>(path: string): Promise<T> {
   throw new Error(`${path} 파일을 읽을 수 없습니다: ${errorText(last)}. 다시 시도해 주세요.`);
 }
 
-async function modelBytes(file: typeof MODEL_FILES[number], precedingBytes: number): Promise<Uint8Array> {
+async function modelBytes(file: typeof MODEL_FILES[number], precedingBytes: number, bypassCache = false): Promise<Uint8Array> {
   const path = `onnx/${file.name}.onnx`;
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     let response: Response | undefined;
     try {
-      response = await cachedFetch(path);
+      response = await cachedFetch(path, bypassCache);
       // Allocate only once instead of retaining the stream chunks alongside a
       // second large buffer; vector_estimator alone is about 245 MiB.
       const bytes = new Uint8Array(file.size);
@@ -150,6 +151,22 @@ async function release(sessions: ort.InferenceSession[]) {
   await Promise.all(sessions.map(async (session) => { try { await session.release(); } catch { /* best effort */ } }));
 }
 
+async function isCorruptModel(bytes: Uint8Array, file: typeof MODEL_FILES[number]): Promise<boolean> {
+  try {
+    // Only invoked after an ONNX parse failure. SubtleCrypto can copy this large
+    // buffer, so ordinary GPU/OOM errors must never enter this recovery path.
+    const digest = await crypto.subtle.digest('SHA-256', bytes as Uint8Array<ArrayBuffer>);
+    const actual = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
+    return actual !== file.sha256;
+  } catch { return false; } // No trustworthy proof of corruption; keep the cache.
+}
+
+function isModelParseFailure(error: unknown): boolean {
+  return /(?:protobuf.*(?:pars|invalid)|invalid.*(?:protobuf|onnx)|(?:pars|load).*invalid.*model)/i.test(errorText(error));
+}
+
+class GpuInitializationError extends Error {}
+
 async function loadEngine(backend: Backend): Promise<Engine> {
   report('Supertonic 3 모델을 준비합니다. 최초 다운로드는 약 380MB입니다.', 1);
   const [config, indexer] = await Promise.all([
@@ -160,9 +177,23 @@ async function loadEngine(backend: Backend): Promise<Engine> {
   let preceding = 0;
   try {
     for (const file of MODEL_FILES) {
-      const bytes = await modelBytes(file, preceding);
-      report(`${backend === 'webgpu' ? 'GPU' : 'CPU'} 모델을 초기화합니다: ${file.name}`, 3 + 38 * (preceding + file.size) / TOTAL_MODEL_BYTES);
-      loaded.push(await ort.InferenceSession.create(bytes, { executionProviders: [backend], graphOptimizationLevel: 'all' }));
+      for (let attempt = 0; ; attempt++) {
+        const bytes = await modelBytes(file, preceding, attempt > 0);
+        try {
+          report(`${backend === 'webgpu' ? 'GPU' : 'CPU'} 모델을 초기화합니다: ${file.name}`, 3 + 38 * (preceding + file.size) / TOTAL_MODEL_BYTES);
+          loaded.push(await ort.InferenceSession.create(bytes, { executionProviders: [backend], graphOptimizationLevel: 'all' }));
+          break;
+        } catch (error) {
+          if (!isModelParseFailure(error)) {
+            if (backend === 'webgpu') throw new GpuInitializationError(errorText(error));
+            throw error;
+          }
+          if (!await isCorruptModel(bytes, file)) throw error;
+          try { const cache = await caches.open(CACHE_NAME); await cache.delete(`${ROOT}/onnx/${file.name}.onnx`); } catch { /* optional cache */ }
+          if (attempt) throw error;
+          report(`${file.name} 모델 파일이 손상되어 다시 다운로드합니다.`, 0);
+        }
+      }
       preceding += file.size;
     }
     return { config, indexer, backend, sessions: { duration: loaded[0], encoder: loaded[1], vector: loaded[2], vocoder: loaded[3] } };
@@ -178,7 +209,10 @@ async function getEngine(forceCpu = false): Promise<Engine> {
   const canTryGpu = !forceCpu && 'gpu' in navigator;
   if (canTryGpu) {
     try { engine = await loadEngine('webgpu'); return engine; }
-    catch (error) { report(`GPU 초기화 실패. CPU로 다시 시도합니다: ${errorText(error)}`, 0); }
+    catch (error) {
+      if (!(error instanceof GpuInitializationError)) throw error;
+      report(`GPU 초기화 실패. CPU로 다시 시도합니다: ${errorText(error)}`, 0);
+    }
   }
   engine = await loadEngine('wasm');
   return engine;
@@ -195,15 +229,54 @@ async function voiceStyle(voice: string): Promise<Style> {
 }
 
 function normalizeText(input: string, lang: TtsOptions['lang']): string {
-  let text = input.normalize('NFKD');
+  // Detect emoji-only input before compatibility normalization can turn symbols
+  // such as ™ into letters. Keep ordinary text normalization unchanged.
+  const visible = input.replace(/[0-9#*]\uFE0F?\u20E3/gu, '')
+    .replace(/[\p{Extended_Pictographic}\p{Emoji_Presentation}\p{Default_Ignorable_Code_Point}\p{Mark}\s]/gu, '');
+  if (!visible) return '';
+  // Strip emoji-style symbols before NFKD (e.g. ™️ would otherwise become "TM").
+  let text = input.replace(/[0-9#*]\uFE0F?\u20E3/gu, '').replace(/\p{Extended_Pictographic}\uFE0F/gu, '').normalize('NFKD');
   text = text.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F700}-\u{1F77F}\u{1F780}-\u{1F7FF}\u{1F800}-\u{1F8FF}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}]+/gu, '');
+  text = text.replace(/[\u200D\uFE0E\uFE0F\u{E0020}-\u{E007F}]/gu, '');
   const replacements: Record<string, string> = { '–': '-', '‑': '-', '—': '-', '_': ' ', '“': '"', '”': '"', '‘': "'", '’': "'", '´': "'", '`': "'", '[': ' ', ']': ' ', '|': ' ', '/': ' ', '#': ' ', '→': ' ', '←': ' ' };
   for (const [from, to] of Object.entries(replacements)) text = text.replaceAll(from, to);
   text = text.replace(/[♥☆♡©\\]/g, '').replaceAll('@', ' at ').replaceAll('e.g.,', 'for example, ').replaceAll('i.e.,', 'that is, ');
   text = text.replace(/\s+([,.!?;:'])/g, '$1').replace(/"{2,}/g, '"').replace(/'{2,}/g, "'").replace(/\s+/g, ' ').trim();
-  if (!text) return '';
+  if (!text.replace(/[\p{Mark}\p{Default_Ignorable_Code_Point}\s]/gu, '')) return '';
   if (!/[.!?;:,'"')\]}…。 」』】〉》›»]$/.test(text)) text += '.';
   return `<${lang}>${text}</${lang}>`;
+}
+
+// Fallback for browsers without Intl.Segmenter: keep combining marks, emoji
+// sequences, regional indicator pairs and decomposed Hangul syllables together.
+function fallbackGraphemes(input: string): string[] {
+  const result: string[] = [];
+  let current = '', previous = '', regionalCount = 0;
+  const hangul = (char: string): string => {
+    const cp = char.codePointAt(0) ?? 0;
+    if ((cp >= 0x1100 && cp <= 0x115f) || (cp >= 0xa960 && cp <= 0xa97c)) return 'L';
+    if ((cp >= 0x1160 && cp <= 0x11a7) || (cp >= 0xd7b0 && cp <= 0xd7c6)) return 'V';
+    if ((cp >= 0x11a8 && cp <= 0x11ff) || (cp >= 0xd7cb && cp <= 0xd7fb)) return 'T';
+    if (cp >= 0xac00 && cp <= 0xd7a3) return (cp - 0xac00) % 28 === 0 ? 'LV' : 'LVT';
+    return '';
+  };
+  for (const char of input) {
+    const cp = char.codePointAt(0)!;
+    const regional = cp >= 0x1f1e6 && cp <= 0x1f1ff;
+    const before = hangul(previous), after = hangul(char);
+    const hangulJoin = (before === 'L' && ['L', 'V', 'LV', 'LVT'].includes(after)) ||
+      (['LV', 'V'].includes(before) && ['V', 'T'].includes(after)) ||
+      (['LVT', 'T'].includes(before) && after === 'T');
+    const extend = /[\p{Mark}\p{Emoji_Modifier}]/u.test(char) || char === '\u200c' || char === '\u200d' ||
+      (cp >= 0xe0020 && cp <= 0xe007f);
+    const joins = !!current && (extend || previous === '\u200d' || hangulJoin || (regional && regionalCount % 2 === 1));
+    if (!joins && current) { result.push(current); current = ''; }
+    current += char;
+    regionalCount = regional ? regionalCount + 1 : 0;
+    previous = char;
+  }
+  if (current) result.push(current);
+  return result;
 }
 
 /** Sentence/paragraph-aware chunks, with a hard cap even for unpunctuated text. */
@@ -213,31 +286,75 @@ function splitText(text: string, lang: TtsOptions['lang']): string[] {
   const paragraphs = text.trim().split(/\n\s*\n+/).filter(Boolean);
   const Segmenter = Intl.Segmenter;
   const segmenter = typeof Segmenter === 'function' ? new Segmenter(lang, { granularity: 'sentence' }) : null;
+  const graphemeSegmenter = typeof Segmenter === 'function' ? new Segmenter(lang, { granularity: 'grapheme' }) : null;
   for (const paragraph of paragraphs) {
     const sentences = segmenter
       ? Array.from(segmenter.segment(paragraph), (s) => s.segment.trim()).filter(Boolean)
       : paragraph.split(/(?<=[.!?。！？])\s+/).map((s) => s.trim()).filter(Boolean);
     let current = '';
     for (const sentence of sentences) {
-      let rest = sentence;
-      while (Array.from(rest).length > limit) {
-        if (current) { result.push(current); current = ''; }
-        const chars = Array.from(rest);
-        const prefix = chars.slice(0, limit).join('');
-        // Prefer a word/punctuation boundary, but never drop a long unbroken word.
-        const boundary = Math.max(prefix.lastIndexOf(' '), prefix.lastIndexOf(','), prefix.lastIndexOf('，'), prefix.lastIndexOf(';'));
-        const count = boundary >= limit / 3 ? Array.from(prefix.slice(0, boundary + 1)).length : limit;
-        result.push(chars.slice(0, count).join('').trim());
-        rest = chars.slice(count).join('').trim();
+      const codePoints = Array.from(sentence);
+      // A short sentence cannot cross a chunk boundary. Plain ASCII has no
+      // multi-code-point graphemes except CRLF, so it can use the same fast path.
+      if (codePoints.length <= limit) {
+        const candidate = current ? `${current} ${sentence}` : sentence;
+        if (Array.from(candidate).length <= limit) current = candidate;
+        else { if (current) result.push(current); current = sentence; }
+        continue;
       }
-      if (!rest) continue;
-      const candidate = current ? `${current} ${rest}` : rest;
-      if (Array.from(candidate).length <= limit) current = candidate;
-      else { if (current) result.push(current); current = rest; }
+      const graphemes = /^[\x00-\x7f]*$/.test(sentence) && !sentence.includes('\r\n') ? codePoints : graphemeSegmenter
+        ? Array.from(graphemeSegmenter.segment(sentence), (s) => s.segment)
+        : fallbackGraphemes(sentence);
+      let start = 0;
+      while (start < graphemes.length) {
+        let end = start, count = 0, boundaryEnd = 0, boundaryCount = 0;
+        while (end < graphemes.length) {
+          const size = Array.from(graphemes[end]).length;
+          if (size > limit) throw new Error('한 글자소가 허용 길이를 초과했습니다. 텍스트를 확인해 주세요.');
+          if (count + size > limit) break;
+          count += size;
+          if (/^[ ,，;]/u.test(graphemes[end])) { boundaryEnd = end + 1; boundaryCount = count; }
+          end++;
+        }
+        if (end === graphemes.length) {
+          const rest = graphemes.slice(start, end).join('').trim();
+          if (rest) {
+            const candidate = current ? `${current} ${rest}` : rest;
+            if (Array.from(candidate).length <= limit) current = candidate;
+            else { if (current) result.push(current); current = rest; }
+          }
+          break;
+        }
+        if (current) { result.push(current); current = ''; }
+        // Prefer a word/punctuation boundary, without splitting a grapheme.
+        if (boundaryCount > limit / 3) end = boundaryEnd;
+        const chunk = graphemes.slice(start, end).join('').trim();
+        if (chunk) result.push(chunk);
+        start = end;
+        while (start < graphemes.length && !graphemes[start].trim()) start++;
+      }
     }
     if (current) result.push(current);
   }
   return result.filter(Boolean);
+}
+
+class GpuInferenceError extends Error {}
+
+function isGpuRuntimeFailure(error: unknown): boolean {
+  const text = errorText(error);
+  // A provider name can appear in a shape/type error; such errors cannot be
+  // fixed by downloading and recreating the same model on the CPU.
+  if (/(?:invalid|incorrect|unexpected|mismatch(?:ed)?).{0,40}(?:input|dimension|shape|tensor|type)|(?:input|dimension|shape|tensor|type).{0,40}(?:invalid|incorrect|unexpected|mismatch)/i.test(text)) return false;
+  return /\b(?:webgpu|wgpu|gpu(?:device|buffer|adapter|validationerror)?|device lost|device was lost|out of (?:gpu )?memory|out-of-memory|oom|failed to (?:create|allocate) (?:a )?(?:gpu )?buffer)\b/i.test(text);
+}
+
+async function runSession(e: Engine, session: ort.InferenceSession, feeds: Parameters<ort.InferenceSession['run']>[0]) {
+  try { return await session.run(feeds); }
+  catch (error) {
+    if (e.backend === 'webgpu' && isGpuRuntimeFailure(error)) throw new GpuInferenceError(errorText(error));
+    throw error;
+  }
 }
 
 async function synthesizeChunk(e: Engine, text: string, options: TtsOptions, style: Style, chunkIndex: number, chunkCount: number): Promise<Float32Array> {
@@ -246,10 +363,10 @@ async function synthesizeChunk(e: Engine, text: string, options: TtsOptions, sty
   const length = ids.length;
   const textIds = new ort.Tensor('int64', BigInt64Array.from(ids), [1, length]);
   const textMask = new ort.Tensor('float32', new Float32Array(length).fill(1), [1, 1, length]);
-  const durationOutput = await e.sessions.duration.run({ text_ids: textIds, style_dp: style.dp, text_mask: textMask });
+  const durationOutput = await runSession(e, e.sessions.duration, { text_ids: textIds, style_dp: style.dp, text_mask: textMask });
   const seconds = Number(durationOutput.duration.data[0]) / options.speed;
   if (!Number.isFinite(seconds) || seconds <= 0 || seconds > 180) throw new Error('모델이 올바르지 않은 음성 길이를 반환했습니다. 텍스트를 나누어 다시 시도해 주세요.');
-  const embedding = await e.sessions.encoder.run({ text_ids: textIds, style_ttl: style.ttl, text_mask: textMask });
+  const embedding = await runSession(e, e.sessions.encoder, { text_ids: textIds, style_ttl: style.ttl, text_mask: textMask });
   const { sample_rate: sampleRate, base_chunk_size: baseChunkSize } = e.config.ae;
   const { chunk_compress_factor: compress, latent_dim: latentDim } = e.config.ttl;
   const wavLength = Math.floor(seconds * sampleRate);
@@ -264,7 +381,7 @@ async function synthesizeChunk(e: Engine, text: string, options: TtsOptions, sty
   const totalStep = new ort.Tensor('float32', new Float32Array([STEPS]), [1]);
   for (let step = 0; step < STEPS; step++) {
     report(`음성 생성 중: ${chunkIndex + 1}/${chunkCount} 구간 (${step + 1}/${STEPS})`, 44 + 50 * (chunkIndex + step / STEPS) / chunkCount);
-    const output = await e.sessions.vector.run({
+    const output = await runSession(e, e.sessions.vector, {
       noisy_latent: new ort.Tensor('float32', latent, [1, channels, latentLength]),
       text_emb: embedding.text_emb,
       style_ttl: style.ttl,
@@ -275,7 +392,7 @@ async function synthesizeChunk(e: Engine, text: string, options: TtsOptions, sty
     });
     latent = output.denoised_latent.data as Float32Array;
   }
-  const output = await e.sessions.vocoder.run({ latent: new ort.Tensor('float32', latent, [1, channels, latentLength]) });
+  const output = await runSession(e, e.sessions.vocoder, { latent: new ort.Tensor('float32', latent, [1, channels, latentLength]) });
   const wav = output.wav_tts.data as Float32Array;
   // The vocoder rounds each latent segment to a full frame. Trim EVERY segment,
   // before inserting pauses, otherwise accumulated padding truncates later speech.
@@ -339,7 +456,7 @@ self.onmessage = async (event: MessageEvent<{ type: 'generate'; options: TtsOpti
     try {
       result = await render(active, options, style);
     } catch (error) {
-      if (active.backend !== 'webgpu') throw error;
+      if (active.backend !== 'webgpu' || !(error instanceof GpuInferenceError)) throw error;
       report(`GPU 추론 실패. CPU로 전체 구간을 다시 생성합니다: ${errorText(error)}`, 0);
       active = await getEngine(true);
       result = await render(active, options, style);

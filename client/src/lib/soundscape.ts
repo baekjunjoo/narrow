@@ -98,6 +98,11 @@ function isNegated(text: string, index: number, length: number, name: EffectName
   // "열고 싶지 않았다" denies the desire, not a separate following clause.
   if (/(?:열|닫|넘|펼|펴|걸|걷)[가-힣]*고$/.test(matched)
     && /^\s*싶지(?:는|도|가)?\s*(?:않|못)/.test(rawAfter)) return true;
+  // "열려고 하지 않았다" denies the intended action, despite the -고
+  // ending looking like a clause boundary. Do not generalize to all -고 verbs.
+  if (/(?:열|닫|넘|펼|펴|걸|걷)[가-힣]*려(?:고(?:는|도)?|는)$/.test(matched)
+    && /^\s*하지(?:는|도)?\s*(?:않|못)/.test(rawAfter)
+    && !/^\s*하지(?:는|도)?\s*않(?:은|는)\s*(?:것|게|거)(?:은|는|이|가)?\s*아니/.test(rawAfter)) return true;
   // A Korean action whose matched verb ends in a connective starts a new clause.
   const after = /(?:고|지만|면서|으며|는데|으나)$/.test(matched)
     ? '' : clauseAfter(rawAfter);
@@ -105,10 +110,16 @@ function isNegated(text: string, index: number, length: number, name: EffectName
     if (/(?:열려|닫혀|펼쳐져|펴져)\s*있/.test(matched + after)) return true;
     if (/^doors?\s+(?:was|were|is|are)\s+(?:open|closed|shut)$/i.test(matched)) return true;
   }
-  if (/\b(?:no|not|never|without|(?:did|does|do|is|are|was|were|has|have|had|could|would|should|ca)n['’]t)\s+(?:[a-z]+\s+){0,3}$/i.test(before)) return true;
+  // Handle only explicit, immediately scoped double negatives. This does not
+  // attempt general semantic inference for arbitrary sentence constructions.
+  const englishDoubleNegative = /\b(?:(?:do|does|did|will|would|can|could|should)\s+not|cannot|(?:do|does|did|wo|would|ca|could|should)n['’]t)\s+not\s*$/i.test(before);
+  const continuingRain = name === 'rain' && /\b(?:not|never|cannot|(?:do|does|did|wo|would|ca|could|should)n['’]t)\s+(?:yet\s+)?(?:stop|cease)\s*$/i.test(before);
+  if (/지(?:는|도)?$/.test(matched) && /^\s*않(?:은|는)\s*(?:것|게|거)(?:은|는|이|가)?\s*아니/.test(rawAfter)) return false;
+  if (/^\s*(?:오|내리|쏟아지|떨어지|들리|나|보이|찾|나타나|듣)지(?:는|도)?\s*않(?:은|는)\s*(?:것|게|거)(?:은|는|이|가)?\s*아니/.test(after)) return false;
+  if (!englishDoubleNegative && !continuingRain && /\b(?:no|not|never|without|cannot|(?:did|does|do|is|are|was|were|has|have|had|could|would|should|ca|wo)n['’]t)\s+(?:[a-z]+\s+){0,3}$/i.test(before)) return true;
   // Negated stopping or letting up describes continuing rain, not its absence.
-  if (!/^\s*(?:(?:(?:did|does|do|had|has|have|was|were|is|are)\s+)?(?:not|never)\b|(?:did|does|do|had|has|have|was|were|is|are)n['’]t\b)\s+(?:yet\s+)?(?:stop|cease|let\s+up)/i.test(after)
-    && /^\s*(?:(?:(?:was|were|is|are|had|has|have|did|does|do)\s+)?(?:not\b|never\b)|(?:was|were|is|are|had|has|have|did|does|do)n['’]t\b|stopped\b|ceased\b)/i.test(after)) return true;
+  if (!/^\s*(?:(?:(?:did|does|do|had|has|have|was|were|is|are|will)\s+)?(?:not|never)\b|cannot\b|(?:did|does|do|had|has|have|was|were|is|are|wo)n['’]t\b)\s+(?:yet\s+)?(?:stop|cease|let\s+up)/i.test(after)
+    && /^\s*(?:(?:(?:was|were|is|are|had|has|have|did|does|do|will)\s+)?(?:not\b|never\b)|cannot\b|(?:was|were|is|are|had|has|have|did|does|do|wo)n['’]t\b|stopped\b|ceased\b)/i.test(after)) return true;
 
   if (/^(?:걸|걷)/.test(matched) && /(?:^|\s)(?:안|못)\s*$/.test(before)) return true;
   if (/(?:^|\s)(?:안|못)\s+(?:열|닫|넘|펼|펴|걸|걷)/.test(matched)) return true;
@@ -141,7 +152,7 @@ function hasPositiveAmbient(text: string, index: number, length: number): boolea
   return false;
 }
 
-function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans: PlannedEffect[]; invalidCount: number; tooShortCount: number } {
+function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans: PlannedEffect[]; invalidCount: number; tooShortCount: number; densityCount: number } {
   const candidates: PlannedEffect[] = [];
   let invalidCount = 0;
   let tooShortCount = 0;
@@ -192,17 +203,21 @@ function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans
   const lastByType = new Map<EffectName, number>();
   const lastByGroup = new Map<'ambient' | 'discrete', number>();
   let last = -Infinity;
+  let densityCount = 0;
   for (const candidate of candidates) {
     const group = candidate.name === 'rain' || candidate.name === 'forest' || candidate.name === 'ocean' ? 'ambient' : 'discrete';
     if (candidate.time - last < GLOBAL_EFFECT_GAP
       || candidate.time - (lastByGroup.get(group) ?? -Infinity) < GROUP_EFFECT_GAP
-      || candidate.time - (lastByType.get(candidate.name) ?? -Infinity) < SAME_EFFECT_GAP) continue;
+      || candidate.time - (lastByType.get(candidate.name) ?? -Infinity) < SAME_EFFECT_GAP) {
+      densityCount++;
+      continue;
+    }
     plans.push(candidate);
     last = candidate.time;
     lastByGroup.set(group, candidate.time);
     lastByType.set(candidate.name, candidate.time);
   }
-  return { plans, invalidCount, tooShortCount };
+  return { plans, invalidCount, tooShortCount, densityCount };
 }
 
 function errorMessage(error: unknown): string {
@@ -289,22 +304,29 @@ async function acquireOfflineSlot(report: (message: string) => void, signal?: Ab
   }
 }
 
-async function loadAsset(context: AudioContext, filename: string, signal?: AbortSignal): Promise<AudioBuffer> {
-  const url = filename === 'music-calm'
+function assetUrl(filename: string): string {
+  return filename === 'music-calm'
     ? `${ASSET_ROOT}/${filename}.mp3`
     : `${ASSET_ROOT}/tinyaudio-v1/${filename}.mp3`;
-  let bytes: ArrayBuffer;
+}
+
+async function readAsset(filename: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+  const url = assetUrl(filename);
   try {
     throwIfAborted(signal);
     const response = await abortable(fetch(url, { credentials: 'same-origin', signal }), signal);
     throwIfAborted(signal);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     throwIfAborted(signal);
-    bytes = await abortable(trackPhysical(response.arrayBuffer()), signal);
+    return await abortable(trackPhysical(response.arrayBuffer()), signal);
   } catch (error) {
     throwIfAborted(signal);
     throw new Error(`음향 파일 ${url}을 불러오지 못했습니다: ${errorMessage(error)}`);
   }
+}
+
+async function decodeAsset(context: AudioContext, filename: string, bytes: ArrayBuffer, signal?: AbortSignal): Promise<AudioBuffer> {
+  const url = assetUrl(filename);
   try {
     throwIfAborted(signal);
     const result = await abortable(trackPhysical(context.decodeAudioData(bytes)), signal);
@@ -538,21 +560,42 @@ async function mixSoundscapeInternal(
     const effectsEnabled = options.effects && options.effectsVolume > 0;
     if (options.music && !musicEnabled) warnings.push('배경음 음량이 0이어서 배경음을 추가하지 않았습니다.');
     if (options.effects && !effectsEnabled) warnings.push('효과음 음량이 0이어서 효과음을 추가하지 않았습니다.');
-    const { plans, invalidCount, tooShortCount } = effectsEnabled ? planEffects(cues, voice.duration, voice) : { plans: [], invalidCount: 0, tooShortCount: 0 };
+    const { plans, invalidCount, tooShortCount, densityCount } = effectsEnabled ? planEffects(cues, voice.duration, voice) : { plans: [], invalidCount: 0, tooShortCount: 0, densityCount: 0 };
     if (invalidCount) warnings.push(`시간 정보가 올바르지 않은 음성 구간 ${invalidCount}개는 효과음 분석에서 제외했습니다.`);
     if (tooShortCount) warnings.push(`끝부분에 재생 시간이 부족한 효과음 ${tooShortCount}개는 생략했습니다.`);
+    if (densityCount) warnings.push(`음향 간격·반복 제한으로 효과음 단서 ${densityCount}개를 생략했습니다. 서로 다른 사건도 포함될 수 있습니다.`);
     if (effectsEnabled && !plans.length && !tooShortCount) warnings.push('원고에서 효과음을 넣을 만한 단서를 찾지 못해 효과음을 추가하지 않았습니다.');
 
     const assets = new Map<string, AudioBuffer>();
-    // Request the same effect assets in the same order, including when no cues
-    // match, so server access logs cannot reveal which manuscript cues matched.
+    const required = new Set<string>([...(musicEnabled ? ['music-calm'] : []), ...plans.map((plan) => plan.name)]);
+    const encodedAssets = new Map<string, ArrayBuffer>();
+    const failures = new Map<string, unknown>();
+    // Fetch and consume all effect responses in the same order, including with
+    // no cues or a failed required file. Never decode before that fixed sequence
+    // finishes: early failure could otherwise reveal a match in access logs.
+    // Cancellation is intentionally immediate and may interrupt the sequence.
     const names = [...(musicEnabled ? ['music-calm'] : []), ...(effectsEnabled ? EFFECT_ASSETS : [])];
     for (let i = 0; i < names.length; i++) {
       throwIfAborted(signal);
       report(`음향 파일을 불러옵니다… (${i + 1}/${names.length})`);
       throwIfAborted(signal);
-      const asset = await loadAsset(decoder, names[i], signal);
-      assets.set(names[i], makeMonoSafeAmbience(decoder, asset));
+      try {
+        const bytes = await readAsset(names[i], signal);
+        if (required.has(names[i])) encodedAssets.set(names[i], bytes);
+      } catch (error) {
+        throwIfAborted(signal);
+        if (required.has(names[i])) failures.set(names[i], error);
+      }
+    }
+    // Failed unneeded assets do not block requested music/effects. A failure of
+    // a needed asset is explicit; the caller retains the original narration.
+    for (const name of names) {
+      if (!required.has(name)) continue;
+      throwIfAborted(signal);
+      if (failures.has(name)) throw failures.get(name);
+      const asset = await decodeAsset(decoder, name, encodedAssets.get(name)!, signal);
+      encodedAssets.delete(name);
+      assets.set(name, makeMonoSafeAmbience(decoder, asset));
     }
     throwIfAborted(signal);
     const scheduled: PlannedEffect[] = [];
