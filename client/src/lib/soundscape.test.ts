@@ -222,6 +222,215 @@ afterEach(async () => {
 });
 
 describe('mixSoundscape', () => {
+  // Each row has its own cue and mix so cooldown/density limits cannot hide a
+  // false positive or negative in the local keyword heuristic.
+  it.each([
+    ['소나기가 쏟아졌다.', '빗소리'],
+    ['폭우가 내렸다.', '빗소리'],
+    ['가랑비가 내렸다.', '빗소리'],
+    ['삼림에 들어갔다.', '숲'],
+    ['산림이 보였다.', '숲'],
+    ['해변에서 쉬었다.', '바다'],
+    ['바닷소리가 들렸다.', '바다'],
+    ['그는 천천히 걸어갔다.', '발소리'],
+    ['그녀는 길을 걸었다.', '발소리'],
+    ['발걸음이 들렸다.', '발소리'],
+    ['문이 쾅 닫혔다.', '문 여닫는 소리'],
+    ['그가 문을 밀어 열었다.', '문 여닫는 소리'],
+    ['책장을 한 장 넘겼다.', '책장 넘기는 소리'],
+    ['페이지가 바스락거렸다.', '책장 넘기는 소리'],
+    ['A downpour began.', '빗소리'],
+    ['They entered the woods.', '숲'],
+    ['A woodland stood nearby.', '숲'],
+    ['They reached the sea.', '바다'],
+    ['Waves crashed.', '바다'],
+    ['She walked down the path.', '발소리'],
+    ['The door creaked open.', '문 여닫는 소리'],
+    ['He slammed the door.', '문 여닫는 소리'],
+    ['The door was opened.', '문 여닫는 소리'],
+    ['He flipped through the pages.', '책장 넘기는 소리'],
+    ['The pages rustled.', '책장 넘기는 소리'],
+    ['She opened her book.', '책장 넘기는 소리'],
+    ['The rain did not stop.', '빗소리'],
+    ['The rain did not let up.', '빗소리'],
+    ["The rain hadn't stopped.", '빗소리'],
+    ['The rain never stopped.', '빗소리'],
+    ['The rain had never stopped.', '빗소리'],
+    ['The rain had never yet stopped.', '빗소리'],
+    ['The rain has not yet stopped.', '빗소리'],
+    ['The rain had not yet let up.', '빗소리'],
+    ['비가 멈추지 않았다.', '빗소리'],
+    ['비가 그치지 않았다.', '빗소리'],
+    ['비가 안 그쳤다.', '빗소리'],
+    ['비가 아직 안 그쳤다.', '빗소리'],
+    ['비가 안 멈췄다.', '빗소리'],
+    ['비가 내릴 것 같았다.', '빗소리'],
+    ['문을 열고 싶었다.', '문 여닫는 소리'],
+  ])('recognizes the positive cue %s', async (text, label) => {
+    const result = await mixSoundscape(voice(), [cue(text)], options);
+    expect(result.events.map((event) => event.label)).toEqual([label]);
+  });
+
+  it.each([
+    ['비가 내렸다.', '빗소리'],
+    ['문을 열었다.', '문 여닫는 소리'],
+    ['그녀가 책장을 넘겼다.', '책장 넘기는 소리'],
+  ])('matches decomposed Korean with the same timing as composed text: %s', async (text, label) => {
+    const composed = await mixSoundscape(voice(), [cue(text)], options);
+    const decomposed = await mixSoundscape(voice(), [cue(text.normalize('NFD'))], options);
+    expect(decomposed.events).toEqual(composed.events);
+    expect(decomposed.events.map((event) => event.label)).toEqual([label]);
+  });
+
+  it.each([
+    ['비가 내릴 것 같지 않았다.', []],
+    ['문을 열고 싶지 않았다.', []],
+    ['비가 안 그쳤다.', ['빗소리']],
+    ['비가 내릴 것 같지 않지만 문을 열었다.', ['문 여닫는 소리']],
+  ])('keeps negation and continuation equivalent after NFC analysis: %s', async (text, labels) => {
+    const composed = await mixSoundscape(voice(), [cue(text)], options);
+    const decomposed = await mixSoundscape(voice(), [cue(text.normalize('NFD'))], options);
+    expect(decomposed.events).toEqual(composed.events);
+    expect(decomposed.events.map((event) => event.label)).toEqual(labels);
+  });
+
+  it.each([
+    '소나기가 내리지 않았다.',
+    '비가 안 내렸다.',
+    '비가 내릴 것 같지 않았다.',
+    '그는 비가 온다고 말하지 않았다.',
+    '그녀는 문을 열었다고 말하지 않았다.',
+    '그는 책장을 넘겼다고 말하지 않았다.',
+    '폭우는 그쳤다.',
+    '비가 멈췄다.',
+    '빗소리가 멈추었다.',
+    '숲이 보이지 않았다.',
+    '숲에 가지 않았다.',
+    '해변이 보이지 않았다.',
+    '바다로 가지 않았다.',
+    '파도 소리는 들리지 않았다.',
+    '발소리가 나지 않았다.',
+    '그는 걸어가지 않았다.',
+    '그는 안 걸었다.',
+    '그는 문을 안 열었다.',
+    '그는 문을 열지 않았다.',
+    '문을 열고 싶지 않았다.',
+    '문을 열고 싶지는 않았다.',
+    '문을 열 수 없었다.',
+    '책을 펼치지 않았다.',
+    '책장을 넘기지 못했다.',
+    'There was no downpour.',
+    'It did not rain.',
+    'It has not yet rained.',
+    "It hasn't yet rained.",
+    'The rain had not yet fallen.',
+    'The rain never fell.',
+    "The rain wasn't falling.",
+    'The rain stopped.',
+    'There was no forest.',
+    'They sailed without the ocean in sight.',
+    'No waves crashed.',
+    'She did not walk.',
+    'No footsteps echoed.',
+    'He did not open the door.',
+    'He had not yet opened the door.',
+    'He had never yet opened the door.',
+    "He hadn't yet opened the door.",
+    'He had not  yet opened the door.',
+    "He didn't open the door.",
+    'She did not say that the door opened.',
+    'She never turned the page.',
+    'He did not flip through the pages.',
+  ])('rejects the negated cue %s', async (text) => {
+    const result = await mixSoundscape(voice(), [cue(text)], options);
+    expect(result.events).toEqual([]);
+  });
+
+  it.each([
+    ['비가 내리고 그는 말하지 않았다.', '빗소리'],
+    ['비가 내리고 그는 비가 온다고 말하지 않았다.', '빗소리'],
+    ['비가 오고 문을 열지 않았다.', '빗소리'],
+    ['비가 오지 않았지만 문을 열었다.', '문 여닫는 소리'],
+    ['비가 내릴 것 같지 않지만 문을 열었다.', '문 여닫는 소리'],
+    ['문을 열고 비가 오지 않았다.', '문 여닫는 소리'],
+    ['문을 열고 아무 말도 하지 않았다.', '문 여닫는 소리'],
+    ['문을 열고 싶지 않지만 책장을 넘겼다.', '책장 넘기는 소리'],
+    ['책장을 넘기고 그는 말하지 않았다.', '책장 넘기는 소리'],
+    ['비가 오지 않았지만 발소리가 들렸다.', '발소리'],
+    ['비가 내리고 바다는 보이지 않았다.', '빗소리'],
+    ['문을 열지 않고 책장을 넘겼다.', '책장 넘기는 소리'],
+    ['비가 오지 않지만 바다가 보였다.', '바다'],
+    ['Rain fell, but she did not open the door.', '빗소리'],
+    ['rain fell, yet the door did not open', '빗소리'],
+    ['Rain fell yet the door did not open.', '빗소리'],
+    ['No rain yet the door opened.', '문 여닫는 소리'],
+    ['The door opened yet it had not yet rained.', '문 여닫는 소리'],
+    ['He did not open the door, but it rained.', '빗소리'],
+    ['No rain, but footsteps echoed.', '발소리'],
+    ['She opened the door and never mentioned the rain.', '문 여닫는 소리'],
+    ['The rain stopped, but she opened the door.', '문 여닫는 소리'],
+    ['비가 내리지 않았지만 나중에 비가 쏟아졌다.', '빗소리'],
+    ['It did not rain but later it rained.', '빗소리'],
+    ['He never opened the door but later opened the door.', '문 여닫는 소리'],
+  ])('keeps independent positive and negative clauses separate: %s', async (text, label) => {
+    const result = await mixSoundscape(voice(), [cue(text)], options);
+    expect(result.events.map((event) => event.label)).toEqual([label]);
+  });
+
+  it('keeps established scene cues over inferred walking, but retains explicit footsteps', async () => {
+    for (const text of ['He walked into the forest.', '그는 숲에서 걸었다.']) {
+      const result = await mixSoundscape(voice(), [cue(text)], options);
+      expect(result.events.map((event) => event.label)).toEqual(['숲']);
+    }
+    const explicit = await mixSoundscape(voice(), [cue('footsteps in the forest', 0, 30)], options);
+    expect(explicit.events.map((event) => event.label)).toEqual(['발소리', '숲']);
+    const absentScene = await mixSoundscape(voice(), [cue('He walked, but there was no forest.')], options);
+    expect(absentScene.events.map((event) => event.label)).toEqual(['발소리']);
+  });
+
+  it.each([
+    ['비가 내리고 문을 열었다.', ['빗소리', '문 여닫는 소리']],
+    ['비가 안 그쳤지만 문을 열었다.', ['빗소리', '문 여닫는 소리']],
+    ['Rain fell and she opened the door.', ['빗소리', '문 여닫는 소리']],
+    ['Rain fell yet the door opened.', ['빗소리', '문 여닫는 소리']],
+    ['비가 내렸고 발소리는 없었지만 문을 열었다.', ['빗소리', '문 여닫는 소리']],
+    ['No rain, but the forest was quiet and he opened the door.', ['숲', '문 여닫는 소리']],
+    ['비가 내리고 그는 천천히 걸었다.', ['빗소리', '발소리']],
+    ['Rain fell. She walked.', ['빗소리', '발소리']],
+    ['He walked and the forest appeared.', ['발소리', '숲']],
+    ['He walked into the forest. Later he walked.', ['숲', '발소리']],
+  ])('plans independent non-overlapping positives in one cue: %s', async (text, labels) => {
+    const result = await mixSoundscape(voice(), [cue(text, 0, 38)], options);
+    expect(result.events.map((event) => event.label)).toEqual(labels);
+  });
+
+  it('keeps identical fixed asset requests for newly recognized and negated cues', async () => {
+    for (const text of ['소나기가 내렸다', '비가 오지 않았지만 문을 열었다', 'She walked', '비밀과 비용']) {
+      vi.mocked(fetch).mockClear();
+      await mixSoundscape(voice(), [cue(text)], options);
+      expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+      for (const [, init] of vi.mocked(fetch).mock.calls) expect(init).toEqual({ credentials: 'same-origin', signal: undefined });
+    }
+  });
+
+  it.each([
+    '비밀과 비용, 비빔밥과 비상.',
+    '문제와 문서, 방문객과 주문.',
+    '바다표범과 파도타기.',
+    '책상과 책갈피, 책장 선반과 페이지 번호.',
+    'rainbow and brainstorm and rainfalling',
+    'forestry and oceanic and seawater',
+    'She waves goodbye.',
+    'The door stood still by page 42.',
+    'The open door and the closed door.',
+    'The door is open.',
+    '문이 열려 있었다.',
+    '책이 펼쳐져 있었다.',
+  ])('does not treat a substring, static object or state as an action: %s', async (text) => {
+    const result = await mixSoundscape(voice(), [cue(text)], options);
+    expect(result.events).toEqual([]);
+  });
+
   it('uses the Vite base for every same-origin asset without exposing manuscript cues', async () => {
     vi.stubEnv('BASE_URL', '/narrow/');
     vi.resetModules();

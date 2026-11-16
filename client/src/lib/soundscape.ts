@@ -35,45 +35,110 @@ const GLOBAL_EFFECT_GAP = 2;
 const SAME_EFFECT_GAP = 30;
 const MIN_EFFECT_TAIL_SECONDS = 0.8;
 
-// A deliberately conservative, local keyword heuristic, not semantic analysis.
-// Korean suffixes are explicit so e.g. "비밀" and "바다표범" are not matches;
-// English word boundaries prevent rain/rainbow and forest/forestry collisions.
-// Page and door require an audible action to avoid bookshelf/page-number mentions.
+// A local keyword heuristic, not semantic analysis. Korean suffixes are explicit
+// and English words are bounded to avoid e.g. 비밀, 바다표범 and rainbow.
+// Door/page require an action; walking and environmental nouns are approximations
+// and can still be figurative or refer to an inaudible scene.
 const RULES: EffectRule[] = [
   {
     name: 'rain', label: '빗소리', maxSeconds: 6,
-    pattern: /(^|[^가-힣A-Za-z])((?:빗소리|빗방울)(?:이|가|은|는|을|를|에|의|도|만)?|비(?:가|는|를|와|에|의|도|만)?)(?![가-힣A-Za-z])|\b(rain(?:s|ing|ed|fall)?|rainfall)\b/giu,
+    pattern: /(^|[^가-힣A-Za-z])((?:빗소리|빗방울|빗줄기|소나기|폭우|장대비|가랑비|비)(?:에서|에는|으로|이|가|은|는|을|를|와|에|의|도|만)?)(?![가-힣A-Za-z])|\b(rain(?:s|ing|ed|fall)?|rainfall|downpours?)\b/giu,
   },
   {
     name: 'forest', label: '숲', maxSeconds: 6,
-    pattern: /(^|[^가-힣A-Za-z])((?:숲속|숲)(?:이|은|을|의|에|에서|으로|도)?)(?![가-힣A-Za-z])|\b(forests?)\b/giu,
+    pattern: /(^|[^가-힣A-Za-z])((?:숲속|숲길|숲|삼림|산림)(?:에서|에는|으로|이|가|은|는|을|를|의|에|도)?)(?![가-힣A-Za-z])|\b(forests?|woods|woodlands?)\b/giu,
   },
   {
     name: 'ocean', label: '바다', maxSeconds: 6,
-    pattern: /(^|[^가-힣A-Za-z])((?:바닷가|바닷물|바다|파도)(?:가|이|는|은|를|을|에|에서|로|의|도)?)(?![가-힣A-Za-z])|\b(oceans?)\b/giu,
+    pattern: /(^|[^가-힣A-Za-z])((?:바닷소리|바닷가|바닷물|바다|파도|해변|해안)(?:에서|에는|으로|가|이|는|은|를|을|에|로|의|도)?)(?![가-힣A-Za-z])|\b(oceans?|seas?|waves?\s+(?:crash(?:ed|es|ing)?|break(?:s|ing)?|broke|roll(?:ed|s|ing)?|lap(?:ped|s|ping)?))\b/giu,
   },
   {
     name: 'footsteps', label: '발소리', maxSeconds: 4,
-    pattern: /(^|[^가-힣A-Za-z])((?:발소리|발자국\s*소리|걸음\s*소리)(?:가|는|를|에|의|도)?)(?![가-힣A-Za-z])|\b(footsteps?|footfalls?)\b/giu,
+    pattern: /(^|[^가-힣A-Za-z])((?:(?:발소리|발자국\s*소리|걸음\s*소리|발걸음)(?:이|가|은|는|을|를|에|의|도)?|걸어(?:갔|가|왔|오|다니)[가-힣]*|걸었[가-힣]*|걷(?:는|고|다|지|기)[가-힣]*))(?![가-힣A-Za-z])|\b(footsteps?|footfalls?|walk(?:ed|ing|s)?)\b/giu,
   },
   {
     name: 'door', label: '문 여닫는 소리', maxSeconds: 3,
-    pattern: /(^|[^가-힣A-Za-z])((?:대문|방문|문)(?:을|이|은|는)?\s*(?:(?:살며시|조심스럽게|천천히|활짝|조용히)\s*){0,2}(?:열|닫)[가-힣]*)|\b((?:open(?:ed|ing|s)?|clos(?:e|ed|ing|es)|shut(?:ting|s)?)\s+(?:(?:a|an|the|wooden|front|back|heavy|old)\s+){0,3}doors?|doors?\s+(?:open(?:ed|ing|s)?|clos(?:e|ed|ing|es)|shut(?:ting|s)?))\b/giu,
+    pattern: /(^|[^가-힣A-Za-z])((?:현관문|대문|방문|문)(?:을|이|은|는)?\s*(?:(?:살며시|조심스럽게|천천히|활짝|조용히|쾅|힘껏|세게|밀어|당겨|안|못)\s*){0,2}(?:열|닫)[가-힣]*)|\b((?<!\bthe\s)(?<!\ba\s)(?<!\ban\s)(?:open(?:ed|ing|s)?|clos(?:e|ed|ing|es)|shut(?:ting|s)?|slam(?:med|ming|s)?)\s+(?:(?:a|an|the|wooden|front|back|heavy|old|his|her|their|my|your)\s+){0,3}doors?|doors?\s+(?:(?:was|were|is|are|being)\s+)?(?:(?:creak(?:ed|s|ing)?|swing(?:s|ing)?|swung)\s+)?(?:open(?:ed|ing|s)?|clos(?:e|ed|ing|es)|shut(?:ting|s)?|slam(?:med|ming|s)?))\b/giu,
   },
   {
     name: 'page', label: '책장 넘기는 소리', maxSeconds: 3,
-    pattern: /(^|[^가-힣A-Za-z])((?:책장|페이지|책)(?:을|를|이|은|는)?\s*(?:(?:살며시|천천히|조용히|한\s*장씩)\s*){0,2}(?:넘기|넘겼|넘겨|넘어가|넘어갔|펼치|펼쳤|펼쳐|펴|바스락)[가-힣]*)|\b((?:turn(?:ed|ing|s)?|flip(?:ped|ping|s)?|rustl(?:e|es|ed|ing))\s+(?:(?:a|an|the|of|through|old|book|paper)\s+){0,3}pages?|pages?\s+(?:turn(?:ed|ing|s)?|flip(?:ped|ping|s)?|rustl(?:e|es|ed|ing))|open(?:ed|ing|s)?\s+(?:a|an|the|his|her|their|my|your)\s+(?:(?:old|new|heavy|large|small)\s+){0,2}books?)\b/giu,
+    pattern: /(^|[^가-힣A-Za-z])((?:책장|페이지|책)(?:을|를|이|가|은|는)?\s*(?:(?:살며시|천천히|조용히|한\s*장(?:씩)?|안|못)\s*){0,2}(?:넘기|넘겼|넘겨|넘어가|넘어갔|펼치|펼쳤|펼쳐|펴|바스락)[가-힣]*)|\b((?:turn(?:ed|ing|s)?|flip(?:ped|ping|s)?|rustl(?:e|es|ed|ing))\s+(?:(?:a|an|the|of|through|old|book|paper)\s+){0,3}pages?|pages?\s+(?:turn(?:ed|ing|s)?|flip(?:ped|ping|s)?|rustl(?:e|es|ed|ing))|open(?:ed|ing|s)?\s+(?:a|an|the|his|her|their|my|your)\s+(?:(?:old|new|heavy|large|small)\s+){0,2}books?)\b/giu,
   },
 ];
 
-/** Reject obvious nearby negations; ambiguous language is intentionally not promised as understood. */
-function isNegated(text: string, index: number, length: number): boolean {
-  const before = text.slice(Math.max(0, index - 35), index).split(/[.!?。！？;\n]/).pop() ?? '';
-  const after = text.slice(index + length, index + length + 28).split(/[.!?。！？;\n]/)[0];
-  const koreanContext = text.slice(index, index + length + 28).split(/[.!?。！？;\n]/)[0];
-  return /\b(?:no|not|never|without)\s+(?:[a-z]+\s+){0,3}$/i.test(before)
-    || /^\s*(?:(?:was|were|is|are|had|has|have)\s+)?(?:not\b|never\b|stopped\b|ceased\b)/i.test(after)
-    || /(?:지\s*(?:않|못)|없(?:다|었|어|는|던|이)|그쳤|멈췄)/.test(koreanContext);
+// A small set of clause boundaries prevents unrelated negations from propagating.
+// Korean verb endings are approximate; this does not resolve scope or meaning.
+// Temporal "not/never/n't yet" stays in its clause; conjunctive "yet" breaks it.
+const CLAUSE_BREAK = /[,.!?。！？;\n]|\b(?:and|but|however|although|though|while)\b|(?<!\b(?:not|never)\s+)(?<!n['’]t\s+)\byet\b|[가-힣]+(?:고|지만|면서|으며|는데|으나)\s+/giu;
+
+function clauseBefore(text: string): string {
+  let start = 0;
+  for (const match of text.matchAll(CLAUSE_BREAK)) start = (match.index ?? 0) + match[0].length;
+  return text.slice(start);
+}
+
+function clauseAfter(text: string): string {
+  const boundary = text.matchAll(CLAUSE_BREAK).next().value;
+  if (!boundary || boundary.index === undefined) return text;
+  // Keep the Korean connective itself: e.g. "오지 않고" contains the negator.
+  return text.slice(0, boundary.index + (/^[가-힣]/.test(boundary[0]) ? boundary[0].trimEnd().length : 0));
+}
+
+/** Reject only explicit local negations and obvious static door/page states. */
+function isNegated(text: string, index: number, length: number, name: EffectName): boolean {
+  const matched = text.slice(index, index + length);
+  const before = clauseBefore(text.slice(Math.max(0, index - 60), index));
+  const rawAfter = text.slice(index + length, index + length + 60);
+  // A denied statement is not evidence that its quoted event occurred. This
+  // deliberately handles only nearby -다고/-라고 말하지 않았다 constructions;
+  // it does not infer that the quoted event itself was false.
+  if (/(?:다고|라고)(?:는|도)?$/.test(matched)
+    && /^\s*(?:말|이야기|전|설명)하지\s*(?:않|못)/.test(rawAfter)) return true;
+  if (/^\s+[가-힣]+(?:다고|라고)(?:는|도)?\s+(?:말|이야기|전|설명)하지\s*(?:않|못)/.test(rawAfter)) return true;
+  // "열고 싶지 않았다" denies the desire, not a separate following clause.
+  if (/(?:열|닫|넘|펼|펴|걸|걷)[가-힣]*고$/.test(matched)
+    && /^\s*싶지(?:는|도|가)?\s*(?:않|못)/.test(rawAfter)) return true;
+  // A Korean action whose matched verb ends in a connective starts a new clause.
+  const after = /(?:고|지만|면서|으며|는데|으나)$/.test(matched)
+    ? '' : clauseAfter(rawAfter);
+  if (name === 'door' || name === 'page') {
+    if (/(?:열려|닫혀|펼쳐져|펴져)\s*있/.test(matched + after)) return true;
+    if (/^doors?\s+(?:was|were|is|are)\s+(?:open|closed|shut)$/i.test(matched)) return true;
+  }
+  if (/\b(?:no|not|never|without|(?:did|does|do|is|are|was|were|has|have|had|could|would|should|ca)n['’]t)\s+(?:[a-z]+\s+){0,3}$/i.test(before)) return true;
+  // Negated stopping or letting up describes continuing rain, not its absence.
+  if (!/^\s*(?:(?:(?:did|does|do|had|has|have|was|were|is|are)\s+)?(?:not|never)\b|(?:did|does|do|had|has|have|was|were|is|are)n['’]t\b)\s+(?:yet\s+)?(?:stop|cease|let\s+up)/i.test(after)
+    && /^\s*(?:(?:(?:was|were|is|are|had|has|have|did|does|do)\s+)?(?:not\b|never\b)|(?:was|were|is|are|had|has|have|did|does|do)n['’]t\b|stopped\b|ceased\b)/i.test(after)) return true;
+
+  if (/^(?:걸|걷)/.test(matched) && /(?:^|\s)(?:안|못)\s*$/.test(before)) return true;
+  if (/(?:^|\s)(?:안|못)\s+(?:열|닫|넘|펼|펴|걸|걷)/.test(matched)) return true;
+  if (/지(?:는|도)?$/.test(matched) && /^\s*(?:않|못)/.test(after)) return true;
+  if (/\s*(?:수|수가)\s*없/.test(after) && /(?:열|닫|넘|펼|펴|걸|걷)[가-힣]*$/.test(matched)) return true;
+  if (name === 'door' || name === 'page' || /(?:걸어|걸었|걷)/.test(matched)) return false;
+
+  // Only common absence/silence predicates, not every unrelated "지 않았다".
+  // An explicitly negated stopping predicate ("안 그쳤다") means continuation.
+  const koreanAfter = after.slice(0, 35);
+  return /^(?:\s+\S+){0,3}\s*(?:없|(?<!안\s+)(?<!못\s+)(?:그쳤|그치고|멈췄|멈추었|멈추고|멎었))/.test(koreanAfter)
+    || ((name === 'forest' || name === 'ocean') && /(?:가|들어가)지(?:는|도)?\s*(?:않|못)/.test(koreanAfter))
+    || /(?:올|내릴|쏟아질|떨어질|들릴|날|보일|찾을|나타날|들을)\s+(?:것|거)\s*같지(?:는|도|가)?\s*(?:않|못)/.test(koreanAfter)
+    || /(?:오|내리|쏟아지|떨어지|들리|나|보이|찾|나타나|듣)지(?:는|도)?\s*(?:않|못)/.test(koreanAfter)
+    || /(?:안|못)\s+(?:오|왔|내리|내렸|쏟아지|들리|보이|나타나)/.test(koreanAfter);
+}
+
+function hasPositiveAmbient(text: string, index: number, length: number): boolean {
+  // Do not suppress inferred walking in another clause or sentence of a cue.
+  const clause = clauseBefore(text.slice(Math.max(0, index - 160), index))
+    + text.slice(index, index + length) + clauseAfter(text.slice(index + length, index + length + 160));
+  for (const rule of RULES) {
+    if (rule.name !== 'rain' && rule.name !== 'forest' && rule.name !== 'ocean') continue;
+    for (const match of clause.matchAll(rule.pattern)) {
+      const matchIndex = (match.index ?? 0) + (match[1]?.length ?? 0);
+      const matched = match[2] ?? match[3] ?? '';
+      if (matched && !isNegated(clause, matchIndex, matched.length, rule.name)) return true;
+    }
+  }
+  return false;
 }
 
 function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans: PlannedEffect[]; invalidCount: number; tooShortCount: number } {
@@ -88,17 +153,27 @@ function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans
     }
     const span = Math.min(cue.duration, duration - cue.start);
     if (span <= 0 || !cue.text.length) continue;
+    // PDF and DOCX text may contain decomposed Hangul. Analyze and time the
+    // normalized text together so match offsets and the speech clock agree;
+    // do not mutate the manuscript or the original cue.
+    const normalized = cue.text.normalize('NFC');
+    const analysisCue = normalized === cue.text ? cue : { ...cue, text: normalized };
     let timing: ReturnType<typeof createCueTiming> | undefined;
     for (const rule of RULES) {
       // matchAll clones the regular expression, so state never leaks between cues.
-      for (const match of cue.text.matchAll(rule.pattern)) {
+      for (const match of analysisCue.text.matchAll(rule.pattern)) {
         const prefixLength = match[1]?.length ?? 0;
         const index = (match.index ?? 0) + prefixLength;
         const matched = match[2] ?? match[3] ?? '';
-        if (!matched || isNegated(cue.text, index, matched.length)) continue;
+        if (!matched || isNegated(analysisCue.text, index, matched.length, rule.name)) continue;
+        // Walking alone only implies footsteps. Preserve an explicit setting in
+        // the same clause instead; actual footstep-sound words remain independent.
+        if (rule.name === 'footsteps' && /^(?:walk|걸어|걸었|걷)/i.test(matched)) {
+          if (hasPositiveAmbient(analysisCue.text, index, matched.length)) continue;
+        }
         // Still an estimate, not word-level alignment. Analyze this cue's
         // decoded narration only once, and fall back if its waveform is unclear.
-        timing ??= createCueTiming(cue, voice);
+        timing ??= createCueTiming(analysisCue, voice);
         const discrete = rule.name === 'door' || rule.name === 'footsteps' || rule.name === 'page';
         let time = timing.locate(index, matched.length, discrete);
         // Never report a nominal event that is truncated to silence by the end

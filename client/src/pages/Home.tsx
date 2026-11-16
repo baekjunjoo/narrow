@@ -5,6 +5,7 @@ import {
 } from "lucide-react";
 import { TtsEngine } from "@/lib/tts-engine";
 import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type MixOptions } from "@/lib/soundscape";
+import { extractManuscript } from "@/lib/manuscript-import";
 import BatchConverter from "@/components/BatchConverter";
 import QualityPanel from "@/components/QualityPanel";
 
@@ -64,6 +65,8 @@ export default function Home() {
   const [progress, setProgress] = useState<number | undefined>();
   const [error, setError] = useState("");
   const [fileNotice, setFileNotice] = useState("");
+  const [fileError, setFileError] = useState("");
+  const [fileLoading, setFileLoading] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
   const [music, setMusic] = useState(true);
   const [effects, setEffects] = useState(true);
@@ -74,6 +77,7 @@ export default function Home() {
   // Async mix completions must use the latest user choice, not the render that started the mix.
   const playVersionRef = useRef<"mixed" | "voice">("voice");
   const fileReadRevision = useRef(0);
+  const activeFileRead = useRef<number | null>(null);
   const mounted = useRef(true);
   const engine = useRef<TtsEngine | null>(null);
   const previewAudio = useRef<HTMLAudioElement | null>(null);
@@ -116,6 +120,11 @@ export default function Home() {
     if (next === playVersionRef.current || (next === "mixed" && !result?.mixUrl)) return;
     stopResultAudio();
     updatePlayVersion(next);
+  };
+
+  const invalidateFileRead = () => {
+    fileReadRevision.current++;
+    if (activeFileRead.current !== null) setFileNotice("원고나 제목이 바뀌어 읽고 있는 파일의 결과를 적용하지 않습니다. 파일 읽기가 끝나기를 기다려 주세요.");
   };
 
   const stopPreview = () => {
@@ -189,31 +198,42 @@ export default function Home() {
 
   const loadFile = async (file?: File) => {
     if (!file) return;
-    const revision = ++fileReadRevision.current;
-    setFileNotice("");
-    if (!file.name.toLowerCase().endsWith(".txt")) {
-      setError("지금은 UTF-8 텍스트(.txt) 파일만 불러올 수 있습니다.");
+    if (activeFileRead.current !== null) return;
+    if ((text.trim() || (title.trim() && title !== "나의 오디오북")) && !window.confirm("파일을 불러오면 현재 원고와 제목이 바뀝니다. 계속할까요?")) {
+      setFileError("");
+      setFileNotice("파일 불러오기를 취소했습니다. 기존 원고는 그대로 남아 있습니다.");
       return;
     }
+    const revision = ++fileReadRevision.current;
+    activeFileRead.current = revision;
+    setFileLoading(true);
+    setFileError("");
+    setFileNotice("파일에서 원고를 읽고 있습니다. 읽기가 끝날 때까지 제작을 기다려 주세요.");
     const isCurrentRead = () => mounted.current && fileReadRevision.current === revision;
     const announceDiscard = () => {
-      if (mounted.current) setFileNotice("원고나 작업이 변경되어 이전 파일 불러오기를 건너뛰었습니다.");
+      if (mounted.current && activeFileRead.current === revision) setFileNotice("원고나 작업이 변경되어 이전 파일 불러오기를 건너뛰었습니다.");
     };
     try {
-      const bytes = await file.arrayBuffer();
+      const { text: content, warnings } = await extractManuscript(file);
       if (!isCurrentRead()) { announceDiscard(); return; }
-      const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
       setText(content);
-      setTitle(file.name.replace(/\.txt$/i, "") || "나의 오디오북");
-      setError("");
-    } catch {
+      setTitle(file.name.replace(/\.(txt|pdf|docx)$/i, "").slice(0, 100) || "나의 오디오북");
+      const limitNotice = content.length > 10000 ? " 원고가 10,000자를 넘습니다. 내용은 자르지 않았으며, 제작할 때 장이나 단락별로 나눠 주세요." : "";
+      setFileNotice(`원고 ${content.length.toLocaleString()}자를 불러왔습니다.${limitNotice}${warnings.length ? ` ${warnings.join(" ")}` : ""}`);
+    } catch (fileReadError) {
       if (!isCurrentRead()) { announceDiscard(); return; }
-      setError("파일을 읽지 못했습니다. 텍스트를 UTF-8로 저장한 후 다시 불러와 주세요.");
+      setFileNotice("기존 원고는 변경되지 않았습니다.");
+      setFileError(fileReadError instanceof Error ? fileReadError.message : "파일을 읽지 못했습니다. 파일을 확인한 뒤 다시 시도해 주세요.");
+    } finally {
+      if (activeFileRead.current === revision) {
+        activeFileRead.current = null;
+        if (mounted.current) setFileLoading(false);
+      }
     }
   };
 
   const generate = async () => {
-    if (busy) return;
+    if (busy || fileLoading || activeFileRead.current !== null) return;
     if (batchBusy) { setError("일괄 변환 또는 ZIP 준비가 끝난 뒤 제작을 시작해 주세요."); return; }
     if (qualityBusy) { setError("오디오 품질 검사가 끝난 뒤 제작을 시작해 주세요."); return; }
     if (!text.trim()) { setError("먼저 읽을 원고를 입력해 주세요."); return; }
@@ -317,7 +337,7 @@ export default function Home() {
   };
 
   const remix = async () => {
-    if (!result || busy || batchBusy || qualityBusy) return;
+    if (!result || busy || batchBusy || qualityBusy || fileLoading || activeFileRead.current !== null) return;
     const id = ++operation.current;
     setError("");
     if (!currentMix.music && !currentMix.effects) {
@@ -398,11 +418,13 @@ export default function Home() {
               <section className="panel manuscript-panel">
                 <div className="panel-header"><div><div className="section-kicker">YOUR MANUSCRIPT</div><h2><span className="section-number">01</span> 원고 입력</h2><p>텍스트를 직접 입력하거나 파일을 불러오세요.</p></div><div className="header-icon"><FileText size={19} /></div></div>
                 <label className="field-label" htmlFor="book-title">제목 <span>파일명으로 사용돼요</span></label>
-                <input id="book-title" name="secret_book_title" className="title-input" value={title} onChange={event => { fileReadRevision.current++; setTitle(event.target.value); }} maxLength={100} disabled={busy} />
-                <div className="manuscript-label"><label className="field-label" htmlFor="manuscript">원고 <span>최대 10,000자</span></label><div className="text-actions"><button type="button" onClick={() => { fileReadRevision.current++; setText(example[lang]); }} disabled={busy}>예시 원고 넣기</button><span /> <button type="button" onClick={() => fileRef.current?.click()} disabled={busy}><Upload size={13} /> TXT 불러오기</button></div></div>
-                <input ref={fileRef} type="file" accept=".txt,text/plain" hidden onChange={event => { void loadFile(event.target.files?.[0]); event.target.value = ""; }} />
-                <div className="editor-wrap"><textarea id="manuscript" name="secret_manuscript" value={text} onChange={event => { fileReadRevision.current++; setText(event.target.value); }} placeholder="이곳에 들려주고 싶은 이야기를 입력해 주세요.\n\n문장과 문단을 구분하면 더 자연스러운 낭독에 도움이 됩니다." disabled={busy} /><div className="editor-bottom"><span>TXT 파일 또는 직접 입력</span><strong className={text.length > 10000 ? "over-limit" : ""}>{text.length.toLocaleString()} <em>/ 10,000자</em></strong></div></div>
-                {fileNotice && <p className="editor-note" role="status">{fileNotice}</p>}
+                <input id="book-title" name="secret_book_title" className="title-input" value={title} onChange={event => { invalidateFileRead(); setTitle(event.target.value); }} maxLength={100} disabled={busy} />
+                <div className="manuscript-label"><label className="field-label" htmlFor="manuscript">원고 <span>최대 10,000자</span></label><div className="text-actions"><button type="button" onClick={() => { invalidateFileRead(); setText(example[lang]); }} disabled={busy}>예시 원고 넣기</button><span /> <button type="button" onClick={() => fileRef.current?.click()} disabled={busy || fileLoading} aria-describedby="file-import-help"><Upload size={13} aria-hidden="true" /> 파일 불러오기</button></div></div>
+                <input ref={fileRef} type="file" accept=".txt,.pdf,.docx,text/plain,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document" hidden onChange={event => { void loadFile(event.target.files?.[0]); event.target.value = ""; }} />
+                <div className="editor-wrap"><textarea id="manuscript" name="secret_manuscript" value={text} onChange={event => { invalidateFileRead(); setText(event.target.value); }} placeholder="이곳에 들려주고 싶은 이야기를 입력해 주세요.\n\n문장과 문단을 구분하면 더 자연스러운 낭독에 도움이 됩니다." aria-describedby="file-import-help" disabled={busy} /><div className="editor-bottom"><span>직접 입력 또는 TXT · PDF · DOCX</span><strong className={text.length > 10000 ? "over-limit" : ""}>{text.length.toLocaleString()} <em>/ 10,000자</em></strong></div></div>
+                <p className="editor-note" role="status" aria-live="polite">{fileNotice}</p>
+                {fileError && <p className="editor-note" role="alert">{fileError}</p>}
+                <div className="editor-note" id="file-import-help"><Info size={15} aria-hidden="true" /><span>TXT·PDF·DOCX 파일은 20MB까지 기기에서 읽습니다. 스캔한 PDF는 글자를 읽지 못하며, 그림과 복잡한 표·배치는 누락되거나 순서가 달라질 수 있어 확인이 필요합니다.</span></div>
                 <div className="editor-note"><Info size={15} /><span>긴 책은 장이나 단락별로 나눠 제작하면 검수와 수정이 쉬워요.</span></div>
               </section>
 
@@ -445,7 +467,7 @@ export default function Home() {
                   <label className="sound-toggle"><input type="checkbox" checked={effects} onChange={event => setEffects(event.target.checked)} disabled={busy} /><span><strong>장면 효과음</strong><small>원고 속 단서에 맞춰 자동으로 넣어요</small></span></label>
                   <label className="sound-range" htmlFor="effects-volume">효과음 크기 <strong>{Math.round(effectsVolume * 100)}%</strong></label><input className="sound-slider" id="effects-volume" type="range" min="0" max="1" step="0.1" value={effectsVolume} onChange={event => setEffectsVolume(Number(event.target.value))} disabled={busy || !effects} />
                   <label className="sound-toggle"><input type="checkbox" checked={spatial} onChange={event => setSpatial(event.target.checked)} disabled={busy || (!music && !effects)} /><span><strong>입체 음향 · 이어폰 권장</strong><small>효과음에 창작적인 방향과 거리감을 더해요</small></span></label>
-                  <p id="sound-help">비, 숲, 바다, 발소리, 문, 책장 단서를 찾고 낭독의 쉼을 참고해 배치합니다. 단어별 정확한 정렬은 아니므로 문맥과 타이밍을 꼭 확인해 주세요.</p>
+                  <p id="sound-help">비, 숲, 바다, 발소리, 문, 책장과 관련된 표현·동작 및 일부 부정 표현을 살펴보고 낭독의 쉼을 참고해 배치합니다. 문맥을 완전히 이해하거나 단어별로 정확하게 맞추는 기능은 아니므로 효과음과 타이밍을 꼭 확인해 주세요.</p>
                   <p>입체 모드는 개인 맞춤이 아닌 2채널 헤드폰용 시제품입니다. 방향·거리감은 창작적인 연출이며 돌비 애트모스나 영화관 다채널 믹스가 아닙니다.</p>
                   <p>효과음은 TinyAudio로 미리 만든 시험용 AI 음향으로 실제 녹음이 아닙니다. 실시간 생성은 지원하지 않으며, 특히 발소리·문·책장·파도는 실제와 다르거나 작게 들릴 수 있으니 직접 확인해 주세요.</p>
                   <details className="effect-preview">
@@ -461,7 +483,8 @@ export default function Home() {
                   </details>
                   <p>음향 포함 작업은 최대 10분까지 지원합니다. 배경 음악은 별도 시험용 AI 자산이므로 상업 배포 전 이용 권리를 확인해 주세요.</p>
                 </fieldset>
-                <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy || batchBusy || qualityBusy}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
+                <button type="button" className="generate-btn" onClick={() => void generate()} disabled={busy || batchBusy || qualityBusy || fileLoading}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
+                {fileLoading && <p className="batch-busy-note" role="status">원고 파일을 읽는 중입니다. 읽기가 끝난 뒤 오디오를 제작할 수 있어요.</p>}
                 {batchBusy && <p className="batch-busy-note" role="status">일괄 변환 또는 ZIP 준비가 진행 중입니다. 끝난 뒤 오디오를 제작할 수 있어요.</p>}
                 {qualityBusy && <p className="batch-busy-note" role="status">오디오 품질 검사 중입니다. 검사가 끝난 뒤 오디오 제작이나 음향 재적용, 일괄 변환을 시작할 수 있어요.</p>}
                 {busy && <div className="progress-box" role="status"><div className="progress-head"><span>{status}</span>{typeof progress === "number" && <strong>{Math.round(progress)}%</strong>}</div><div className="progress-track"><span style={{ width: `${typeof progress === "number" ? Math.max(3, Math.min(100, progress)) : 8}%` }} /></div><p>{waitingForSoundscape ? "브라우저에서 이미 시작한 음향 작업은 즉시 중단할 수 없어 오래 걸릴 수 있습니다. 작업이 끝날 때까지 새 오디오 작업을 시작할 수 없어요." : "긴 원고는 시간이 걸릴 수 있어요. 제작 중 이 페이지를 열어 두세요."}</p><button type="button" className="cancel-btn" onClick={cancel} disabled={waitingForSoundscape}>{waitingForSoundscape ? "처리 종료 대기 중" : "제작 취소"}</button></div>}
@@ -501,7 +524,7 @@ export default function Home() {
                   {result.events && result.events.length > 0 && <div className="cue-summary"><strong>자동 배치된 효과음</strong><p>{result.events.map(event => `${formatTime(event.time)} ${event.label}`).join(" · ")}</p></div>}
                   {result.warnings?.map((warning, index) => <p className="sound-warning" key={`${index}-${warning}`}>{warning}</p>)}
                   {settingsChanged && <p className="sound-warning">음향 설정을 변경했습니다. 아래 버튼으로 기존 낭독에 다시 적용해 주세요.</p>}
-                  {(settingsChanged || (!result.mixOptions && (music || effects))) && <button type="button" className="remix-btn" onClick={() => void remix()} disabled={busy || batchBusy || qualityBusy}>완성된 낭독에 음향 설정 다시 적용</button>}
+                  {(settingsChanged || (!result.mixOptions && (music || effects))) && <button type="button" className="remix-btn" onClick={() => void remix()} disabled={busy || batchBusy || qualityBusy || fileLoading}>완성된 낭독에 음향 설정 다시 적용</button>}
                   <p className="result-disclaimer">음향 파일은 합쳐진 MP3라서 재생 중 소리별 조절은 되지 않습니다. 새로 제작하면 기존 결과가 교체되므로 필요한 파일은 먼저 다운로드해 주세요. 새로고침하면 화면의 결과는 사라집니다.</p></div> : <div className="output-empty"><div className="empty-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><strong>아직 만들어진 오디오가 없어요</strong><p>원고와 목소리를 선택하고<br />오디오를 만들어 보세요.</p></div>}
                 {result && <a className="quality-shortcut" href="#quality-panel">완성된 오디오 자동 점검 결과 보기 <ArrowRight size={14} aria-hidden="true" /></a>}
               </section>
