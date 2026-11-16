@@ -1,0 +1,8 @@
+libav.js 6.10.9.0 obsolete variant
+Copyright the libav.js authors and FFmpeg, LAME, and other upstream contributors.
+License: GNU Lesser General Public License version 2.1 (see LICENSE-LGPL-2.1.txt).
+
+Unmodified, replaceable JavaScript and WebAssembly artifacts are distributed separately in this directory. Corresponding complete source code, including build scripts and the source archives of FFmpeg and other dependencies, is provided by the upstream 6.10.9 package:
+https://registry.npmjs.org/libav.js/-/libav.js-6.10.9.tgz (package/sources/)
+Upstream source repository and exact release: https://github.com/Yahweasel/libav.js/tree/v6.10.9.0
+The application does not send audio to any server.
