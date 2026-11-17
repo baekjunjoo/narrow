@@ -3,11 +3,13 @@ import { createCueTiming } from './sound-timing';
 import { connectBinaural, EFFECT_SPATIAL_PROFILES, makeMonoSafeAmbience, makeNarrationDucking, type SpatialProfile } from './sound-quality';
 
 /** Times and durations are in seconds on the decoded narration timeline. */
-export type Cue = { text: string; start: number; duration: number };
-export type MixOptions = { music: boolean; effects: boolean; musicVolume: number; effectsVolume: number; spatial?: boolean };
+export type Cue = { text: string; start: number; duration: number; sourceBefore?: string };
+export type EffectName = 'rain' | 'forest' | 'ocean' | 'footsteps' | 'door' | 'page';
+export type CustomSoundRule = { id: string; phrase: string; effect: EffectName; enabled: boolean };
+export type SoundRuleSettings = { disabledBuiltins: EffectName[]; customRules: CustomSoundRule[] };
+export type MixOptions = { music: boolean; effects: boolean; musicVolume: number; effectsVolume: number; spatial?: boolean; soundRules?: SoundRuleSettings };
 export type MixResult = { blob: Blob; events: { label: string; time: number }[]; warnings: string[] };
 
-type EffectName = 'rain' | 'forest' | 'ocean' | 'footsteps' | 'door' | 'page';
 type EffectRule = { name: EffectName; label: string; pattern: RegExp; maxSeconds: number };
 type PlannedEffect = { name: EffectName; label: string; time: number; maxSeconds: number };
 
@@ -34,6 +36,8 @@ const GROUP_EFFECT_GAP = 6;
 const GLOBAL_EFFECT_GAP = 2;
 const SAME_EFFECT_GAP = 30;
 const MIN_EFFECT_TAIL_SECONDS = 0.8;
+const MAX_CUSTOM_RULES = 50;
+const MAX_CUSTOM_PHRASE_CODE_POINTS = 80;
 
 // A local keyword heuristic, not semantic analysis. Korean suffixes are explicit
 // and English words are bounded to avoid e.g. 비밀, 바다표범 and rainbow.
@@ -65,6 +69,76 @@ const RULES: EffectRule[] = [
     pattern: /(^|[^가-힣A-Za-z])((?:책장|페이지|책)(?:을|를|이|가|은|는)?\s*(?:(?:살며시|천천히|조용히|한\s*장(?:씩)?|안|못)\s*){0,2}(?:넘기|넘겼|넘겨|넘어가|넘어갔|펼치|펼쳤|펼쳐|펴|바스락)[가-힣]*)|\b((?:turn(?:ed|ing|s)?|flip(?:ped|ping|s)?|rustl(?:e|es|ed|ing))\s+(?:(?:a|an|the|of|through|old|book|paper)\s+){0,3}pages?|pages?\s+(?:turn(?:ed|ing|s)?|flip(?:ped|ping|s)?|rustl(?:e|es|ed|ing))|open(?:ed|ing|s)?\s+(?:a|an|the|his|her|their|my|your)\s+(?:(?:old|new|heavy|large|small)\s+){0,2}books?)\b/giu,
   },
 ];
+
+type ActiveCustomRule = { rule: EffectRule; foldedPhrase: string };
+type ActiveSoundRules = { disabled: Set<EffectName>; custom: ActiveCustomRule[] };
+type MatchRange = { rule: EffectRule; start: number; end: number };
+
+// A malformed optional config is ignored, rather than breaking an otherwise
+// valid mix. Only the first 50 supplied entries are examined, even if malformed.
+// Length is measured in Unicode code points after trim and NFC normalization.
+function resolveSoundRules(value: unknown): ActiveSoundRules {
+  const disabled = new Set<EffectName>();
+  const custom: ActiveCustomRule[] = [];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { disabled, custom };
+  const settings = value as Record<string, unknown>;
+  if (Array.isArray(settings.disabledBuiltins)) {
+    for (const name of settings.disabledBuiltins) {
+      if (typeof name === 'string' && EFFECT_ASSETS.includes(name as EffectName)) disabled.add(name as EffectName);
+    }
+  }
+  if (!Array.isArray(settings.customRules)) return { disabled, custom };
+  const seen = new Set<string>();
+  const ids = new Set<string>();
+  for (const entry of settings.customRules.slice(0, MAX_CUSTOM_RULES)) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+    const item = entry as Record<string, unknown>;
+    if (typeof item.id !== 'string' || !item.id || item.id !== item.id.trim()
+      || /[\u0000-\u001f\u007f-\u009f]/u.test(item.id) || ids.has(item.id)
+      || typeof item.phrase !== 'string' || typeof item.enabled !== 'boolean'
+      || typeof item.effect !== 'string') continue;
+    let idLength = 0;
+    for (const _character of item.id) {
+      if (++idLength > 128) break;
+    }
+    if (idLength > 128) continue;
+    const rule = RULES.find((candidate) => candidate.name === item.effect);
+    if (!rule) continue;
+    const phrase = item.phrase.trim().normalize('NFC');
+    if (!phrase) continue;
+    let count = 0;
+    for (const _character of phrase) {
+      if (++count > MAX_CUSTOM_PHRASE_CODE_POINTS) break;
+    }
+    if (count > MAX_CUSTOM_PHRASE_CODE_POINTS) continue;
+    ids.add(item.id);
+    if (!item.enabled) continue;
+    const foldedPhrase = phrase.toUpperCase();
+    const key = `${rule.name}\0${foldedPhrase}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    custom.push({ rule, foldedPhrase });
+  }
+  return { disabled, custom };
+}
+
+// Case conversion can expand a character (e.g. ß -> SS). Keep a mapping at
+// character boundaries so timing and negation use offsets in the NFC cue, and
+// a phrase cannot match only half of an expanded or supplementary character.
+function foldCue(text: string): { folded: string; boundaries: Map<number, number> } {
+  const pieces: string[] = [];
+  const boundaries = new Map<number, number>([[0, 0]]);
+  let originalOffset = 0;
+  let foldedOffset = 0;
+  for (const character of text) {
+    const folded = character.toUpperCase();
+    pieces.push(folded);
+    originalOffset += character.length;
+    foldedOffset += folded.length;
+    boundaries.set(foldedOffset, originalOffset);
+  }
+  return { folded: pieces.join(''), boundaries };
+}
 
 // A small set of clause boundaries prevents unrelated negations from propagating.
 // Korean verb endings are approximate; this does not resolve scope or meaning.
@@ -137,12 +211,24 @@ function isNegated(text: string, index: number, length: number, name: EffectName
     || /(?:안|못)\s+(?:오|왔|내리|내렸|쏟아지|들리|보이|나타나)/.test(koreanAfter);
 }
 
-function hasPositiveAmbient(text: string, index: number, length: number): boolean {
+// Built-in Korean patterns include particles. For a literal custom phrase,
+// include an immediately following standalone particle only for negation
+// analysis, not for the user's match range or its timing. This remains a local
+// heuristic, not a complete understanding of negation or Korean morphology.
+function isCustomMatchNegated(text: string, start: number, end: number, name: EffectName): boolean {
+  const particle = /[가-힣]$/u.test(text.slice(start, end))
+    ? /^(?:에서|에는|으로|이|가|은|는|을|를|와|과|에|의|도|만|로)(?=$|[^가-힣])/u.exec(text.slice(end))?.[0] ?? ''
+    : '';
+  return isNegated(text, start, end - start + particle.length, name);
+}
+
+function hasPositiveAmbient(text: string, index: number, length: number, disabled: Set<EffectName>): boolean {
   // Do not suppress inferred walking in another clause or sentence of a cue.
   const clause = clauseBefore(text.slice(Math.max(0, index - 160), index))
     + text.slice(index, index + length) + clauseAfter(text.slice(index + length, index + length + 160));
   for (const rule of RULES) {
     if (rule.name !== 'rain' && rule.name !== 'forest' && rule.name !== 'ocean') continue;
+    if (disabled.has(rule.name)) continue;
     for (const match of clause.matchAll(rule.pattern)) {
       const matchIndex = (match.index ?? 0) + (match[1]?.length ?? 0);
       const matched = match[2] ?? match[3] ?? '';
@@ -152,25 +238,49 @@ function hasPositiveAmbient(text: string, index: number, length: number): boolea
   return false;
 }
 
-function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans: PlannedEffect[]; invalidCount: number; tooShortCount: number; densityCount: number } {
-  const candidates: PlannedEffect[] = [];
+function planEffects(cues: Cue[], duration: number, voice: AudioBuffer, soundRules: unknown): { plans: PlannedEffect[]; invalidCount: number; tooShortCount: number; densityCount: number; uncheckedBoundaries: boolean } {
+  const candidates: Array<PlannedEffect & { cueIndex: number; custom: boolean; order: number }> = [];
+  const { disabled, custom } = resolveSoundRules(soundRules);
   let invalidCount = 0;
   let tooShortCount = 0;
-  for (const cue of cues) {
+  type Analyzed = { cueIndex: number; cue: Cue; analysisCue: Cue; builtinRanges: Map<EffectName, MatchRange[]>; timing?: ReturnType<typeof createCueTiming> };
+  type Part = { cueIndex: number; start: number; end: number };
+  type CustomMatch = { rule: EffectRule; parts: Part[] };
+  const analyzed: Array<Analyzed | undefined> = [];
+  const addCandidate = (record: Analyzed, rule: EffectRule, index: number, length: number, isCustom = false): boolean => {
+    const { cue, analysisCue } = record;
+    // Retain the original per-cue clock; never estimate time using a merged cue.
+    record.timing ??= createCueTiming(analysisCue, voice);
+    const discrete = rule.name === 'door' || rule.name === 'footsteps' || rule.name === 'page';
+    let time = record.timing.locate(index, length, discrete);
+    const latestStart = duration - MIN_EFFECT_TAIL_SECONDS;
+    if (time > latestStart) {
+      if (cue.start > latestStart) { tooShortCount++; return false; }
+      time = latestStart;
+    }
+    candidates.push({ name: rule.name, label: rule.label, time, maxSeconds: rule.maxSeconds,
+      cueIndex: record.cueIndex, custom: isCustom, order: candidates.length });
+    return true;
+  };
+  for (const [cueIndex, cue] of cues.entries()) {
     if (!cue || typeof cue.text !== 'string' || !Number.isFinite(cue.start) || !Number.isFinite(cue.duration)
       || cue.start < 0 || cue.start >= duration || cue.duration <= 0) {
       invalidCount++;
+      analyzed.push(undefined);
       continue;
     }
     const span = Math.min(cue.duration, duration - cue.start);
-    if (span <= 0 || !cue.text.length) continue;
+    if (span <= 0 || !cue.text.length) { analyzed.push(undefined); continue; }
     // PDF and DOCX text may contain decomposed Hangul. Analyze and time the
     // normalized text together so match offsets and the speech clock agree;
     // do not mutate the manuscript or the original cue.
     const normalized = cue.text.normalize('NFC');
     const analysisCue = normalized === cue.text ? cue : { ...cue, text: normalized };
-    let timing: ReturnType<typeof createCueTiming> | undefined;
+    const builtinRanges = new Map<EffectName, MatchRange[]>();
+    const record: Analyzed = { cueIndex, cue, analysisCue, builtinRanges };
+    analyzed.push(record);
     for (const rule of RULES) {
+      if (disabled.has(rule.name)) continue;
       // matchAll clones the regular expression, so state never leaks between cues.
       for (const match of analysisCue.text.matchAll(rule.pattern)) {
         const prefixLength = match[1]?.length ?? 0;
@@ -180,25 +290,111 @@ function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans
         // Walking alone only implies footsteps. Preserve an explicit setting in
         // the same clause instead; actual footstep-sound words remain independent.
         if (rule.name === 'footsteps' && /^(?:walk|걸어|걸었|걷)/i.test(matched)) {
-          if (hasPositiveAmbient(analysisCue.text, index, matched.length)) continue;
+          if (hasPositiveAmbient(analysisCue.text, index, matched.length, disabled)) continue;
         }
-        // Still an estimate, not word-level alignment. Analyze this cue's
-        // decoded narration only once, and fall back if its waveform is unclear.
-        timing ??= createCueTiming(analysisCue, voice);
-        const discrete = rule.name === 'door' || rule.name === 'footsteps' || rule.name === 'page';
-        let time = timing.locate(index, matched.length, discrete);
-        // Never report a nominal event that is truncated to silence by the end
-        // of the narration. Shift locally inside the same cue when possible.
-        const latestStart = duration - MIN_EFFECT_TAIL_SECONDS;
-        if (time > latestStart) {
-          if (cue.start > latestStart) { tooShortCount++; continue; }
-          time = latestStart;
+        if (addCandidate(record, rule, index, matched.length) && custom.length) {
+          const ranges = builtinRanges.get(rule.name) ?? [];
+          ranges.push({ rule, start: index, end: index + matched.length });
+          builtinRanges.set(rule.name, ranges);
         }
-        candidates.push({ name: rule.name, label: rule.label, time, maxSeconds: rule.maxSeconds });
       }
     }
   }
-  candidates.sort((a, b) => a.time - b.time);
+  // sourceBefore is an attestation from the splitter: BOTH full cue strings
+  // were exact original substrings and the gap is the actual original whitespace.
+  // Old/manual cues have no attestation and are never blindly concatenated.
+  const connected = (index: number): boolean => {
+    const before = analyzed[index - 1], after = analyzed[index];
+    const gap = after?.cue.sourceBefore;
+    return !!before && !!after && typeof gap === 'string' && gap.length <= 512 && /^\s*$/u.test(gap)
+      && before.cue.text.length <= 480 && after.cue.text.length <= 480
+      && after.cue.start >= before.cue.start + before.cue.duration;
+  };
+  let uncheckedBoundaries = false;
+  if (custom.length) {
+    const lastCustomEnd = new Map<EffectName, Part>();
+    for (let i = 1; i < cues.length; i++) if (!connected(i)) uncheckedBoundaries = true;
+    for (let i = 0; i < analyzed.length; i++) {
+      const first = analyzed[i];
+      if (!first) continue;
+      // Limit temporary matches to this starting cue rather than the whole book.
+      const customMatches: CustomMatch[] = [];
+      const local = foldCue(first.analysisCue.text);
+      for (const { rule, foldedPhrase } of custom) {
+        for (let from = 0; from <= local.folded.length - foldedPhrase.length;) {
+          const found = local.folded.indexOf(foldedPhrase, from);
+          if (found < 0) break;
+          from = found + 1; // Include overlapping occurrences, never user regex.
+          const start = local.boundaries.get(found), end = local.boundaries.get(found + foldedPhrase.length);
+          if (start === undefined || end === undefined || end <= start
+            || isCustomMatchNegated(first.analysisCue.text, start, end, rule.name)) continue;
+          customMatches.push({ rule, parts: [{ cueIndex: i, start, end }] });
+        }
+      }
+      if (i + 1 < analyzed.length && connected(i + 1)) {
+        // Include bounded real preceding context for the existing negation heuristic.
+        let prefix = '', beforeIndex = i;
+        while (beforeIndex > 0 && prefix.length < 60 && connected(beforeIndex)) {
+          const previous = analyzed[beforeIndex - 1]!;
+          prefix = previous.analysisCue.text + analyzed[beforeIndex]!.cue.sourceBefore!.normalize('NFC') + prefix;
+          beforeIndex--;
+        }
+        if (prefix.length > 60) prefix = prefix.slice(-60);
+        let text = prefix + first.analysisCue.text;
+        const firstStart = prefix.length, firstEnd = text.length;
+        const segments: Array<{ cueIndex: number; start: number; end: number }> = [{ cueIndex: i, start: firstStart, end: firstEnd }];
+        let lastIndex = i;
+        // 80 NFC code points occupy at most 160 UTF-16 units. The extra 160
+        // provide negation context, without building an unbounded manuscript.
+        while (lastIndex + 1 < analyzed.length && connected(lastIndex + 1) && text.length - firstEnd < 320) {
+          const next = analyzed[++lastIndex]!;
+          text += next.cue.sourceBefore!.normalize('NFC');
+          const start = text.length;
+          text += next.analysisCue.text;
+          segments.push({ cueIndex: lastIndex, start, end: text.length });
+        }
+        const { folded, boundaries } = foldCue(text);
+        for (const { rule, foldedPhrase } of custom) {
+          for (let from = 0; from <= folded.length - foldedPhrase.length;) {
+            const found = folded.indexOf(foldedPhrase, from);
+            if (found < 0) break;
+            from = found + 1;
+            const start = boundaries.get(found), end = boundaries.get(found + foldedPhrase.length);
+            if (start === undefined || end === undefined || start < firstStart || start >= firstEnd || end <= firstEnd) continue;
+            const parts = segments.flatMap(segment => {
+              const a = Math.max(start, segment.start), b = Math.min(end, segment.end);
+              return a < b ? [{ cueIndex: segment.cueIndex, start: a - segment.start, end: b - segment.start }] : [];
+            });
+            // Phrases are trimmed, so both ends must be in spoken cue text, not a gap.
+            const lastSegment = segments.find(segment => end > segment.start && end <= segment.end);
+            if (parts.length < 2 || !lastSegment) continue;
+            // Do not guess negation when a nearby, unverifiable boundary hides context.
+            if ((beforeIndex > 0 && start < 60) || (lastIndex < analyzed.length - 1 && text.length - end < 60)) {
+              uncheckedBoundaries = true;
+              continue;
+            }
+            if (!isCustomMatchNegated(text, start, end, rule.name)) customMatches.push({ rule, parts });
+          }
+        }
+      }
+      // Built-ins retain precedence, and longer same-effect overlaps win.
+      customMatches.sort((a, b) => {
+        const aStart = a.parts[0], bStart = b.parts[0], aEnd = a.parts.at(-1)!, bEnd = b.parts.at(-1)!;
+        return aStart.start - bStart.start || bEnd.cueIndex - aEnd.cueIndex || bEnd.end - aEnd.end;
+      });
+      for (const match of customMatches) {
+        const firstPart = match.parts[0], last = match.parts.at(-1)!;
+        const previous = lastCustomEnd.get(match.rule.name);
+        if (previous && (firstPart.cueIndex < previous.cueIndex || (firstPart.cueIndex === previous.cueIndex && firstPart.start < previous.end))) continue;
+        if (match.parts.some(part => (analyzed[part.cueIndex]!.builtinRanges.get(match.rule.name) ?? [])
+          .some(range => range.start < part.end && part.start < range.end))) continue;
+        const discrete = match.rule.name === 'door' || match.rule.name === 'footsteps' || match.rule.name === 'page';
+        const timed = discrete ? last : firstPart;
+        if (addCandidate(analyzed[timed.cueIndex]!, match.rule, timed.start, timed.end - timed.start, true)) lastCustomEnd.set(match.rule.name, last);
+      }
+    }
+  }
+  candidates.sort((a, b) => a.time - b.time || a.cueIndex - b.cueIndex || Number(a.custom) - Number(b.custom) || a.order - b.order);
   const plans: PlannedEffect[] = [];
   const lastByType = new Map<EffectName, number>();
   const lastByGroup = new Map<'ambient' | 'discrete', number>();
@@ -217,7 +413,7 @@ function planEffects(cues: Cue[], duration: number, voice: AudioBuffer): { plans
     lastByGroup.set(group, candidate.time);
     lastByType.set(candidate.name, candidate.time);
   }
-  return { plans, invalidCount, tooShortCount, densityCount };
+  return { plans, invalidCount, tooShortCount, densityCount, uncheckedBoundaries };
 }
 
 function errorMessage(error: unknown): string {
@@ -560,8 +756,9 @@ async function mixSoundscapeInternal(
     const effectsEnabled = options.effects && options.effectsVolume > 0;
     if (options.music && !musicEnabled) warnings.push('배경음 음량이 0이어서 배경음을 추가하지 않았습니다.');
     if (options.effects && !effectsEnabled) warnings.push('효과음 음량이 0이어서 효과음을 추가하지 않았습니다.');
-    const { plans, invalidCount, tooShortCount, densityCount } = effectsEnabled ? planEffects(cues, voice.duration, voice) : { plans: [], invalidCount: 0, tooShortCount: 0, densityCount: 0 };
+    const { plans, invalidCount, tooShortCount, densityCount, uncheckedBoundaries } = effectsEnabled ? planEffects(cues, voice.duration, voice, options.soundRules) : { plans: [], invalidCount: 0, tooShortCount: 0, densityCount: 0, uncheckedBoundaries: false };
     if (invalidCount) warnings.push(`시간 정보가 올바르지 않은 음성 구간 ${invalidCount}개는 효과음 분석에서 제외했습니다.`);
+    if (uncheckedBoundaries) warnings.push('원문 연결 정보를 확인할 수 없는 음성 구간 경계는 사용자 규칙을 가로질러 검사하지 못해 해당 문구가 누락될 수 있습니다.');
     if (tooShortCount) warnings.push(`끝부분에 재생 시간이 부족한 효과음 ${tooShortCount}개는 생략했습니다.`);
     if (densityCount) warnings.push(`음향 간격·반복 제한으로 효과음 단서 ${densityCount}개를 생략했습니다. 서로 다른 사건도 포함될 수 있습니다.`);
     if (effectsEnabled && !plans.length && !tooShortCount) warnings.push('원고에서 효과음을 넣을 만한 단서를 찾지 못해 효과음을 추가하지 않았습니다.');

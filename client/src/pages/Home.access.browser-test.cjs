@@ -93,9 +93,19 @@ check('zero-volume remix preserves focus',active()!==body(),active().tagName);
 before=window.mixCalls;gen=button('오디오 만들기');gen.click();await sleep(450);check('zero-volume generation skips renderer',window.mixCalls===before&&document.querySelector('.version-single')?.textContent.includes('0'));
 let promptCount=window.confirmMessages.length;before=window.mixCalls;window.confirmAnswer=false;setValue(document.querySelector('#music-volume'),'0.5');await sleep(30);remix=button('완성된 낭독에 음향 설정 다시 적용');remix.focus();remix.click();await sleep(30);brand.focus();await sleep(400);
 check('remix without existing mix does not prompt and runs mixer',window.confirmMessages.length===promptCount&&window.mixCalls===before+1&&!!mixUrl());window.confirmAnswer=true;
-check('remix completion remains in live status',[...document.querySelectorAll('[role=status]')].some(n=>n.textContent.includes('음향을 다시 적용했어요')));
-check('remix completion does not steal moved focus',active()===brand,active().tagName);
-// Start, stop, and removal focus behavior; focus remains where user moved it.
+	check('remix completion remains in live status',[...document.querySelectorAll('[role=status]')].some(n=>n.textContent.includes('음향을 다시 적용했어요')));
+	check('remix completion does not steal moved focus',active()===brand,active().tagName);
+	// A custom rule must mark the old mix as stale and reach the real mixer call.
+	setValue(document.querySelector('.sound-rules-editor input'),'열쇠');
+	const effectSelect=document.querySelector('.sound-rules-editor select');
+	effectSelect.value='door';effectSelect.dispatchEvent(new Event('change',{bubbles:true}));await sleep(30);
+	button('규칙 추가').click();await sleep(30);
+	check('new rule marks old mix for reapplication',!!button('완성된 낭독에 음향 설정 다시 적용'));
+	window.confirmAnswer=true;button('완성된 낭독에 음향 설정 다시 적용').click();await sleep(400);
+	check('remix receives configured literal rule',window.lastMixOptions.soundRules.customRules.some(r=>r.phrase==='열쇠'&&r.effect==='door'&&r.enabled));
+	gen=button('오디오 만들기');gen.click();await sleep(760);
+	check('new generation receives configured literal rule',window.lastMixOptions.soundRules.customRules.some(r=>r.phrase==='열쇠'&&r.effect==='door'&&r.enabled));
+	// Start, stop, and removal focus behavior; focus remains where user moved it.
 add(document.querySelector('#batch-files'),['one.wav','two.wav']);await sleep(30);let start=button('대기 항목 변환 시작');start.focus();start.click();await sleep(30);
 check('batch start focus goes to stop',active()===button('변환 중단'),active().tagName);
 button('변환 중단').focus();button('변환 중단').click();await sleep(30);check('batch stop restores focus',active()===button('대기 항목 변환 시작'),active().tagName);

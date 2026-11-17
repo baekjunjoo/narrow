@@ -31,6 +31,19 @@ describe('TtsEngine worker lifecycle', () => {
     await expect(second).resolves.toEqual(result);
     engine.dispose();
   });
+  it('passes optional exact source boundary metadata through without changing cues', async () => {
+    const engine = new TtsEngine();
+    const generated = engine.generate(options, () => {});
+    const worker = FakeWorker.instances[0];
+    const result = { blob: new Blob(['audio']), duration: 2, cues: [
+      { text: '원', start: 0, duration: 0.8 },
+      { text: '고', start: 1.1, duration: 0.9, sourceBefore: '\n\n' },
+    ] };
+    worker.emit({ type: 'result', ...result });
+    await expect(generated).resolves.toEqual(result);
+    expect(worker.postMessage).toHaveBeenCalledTimes(1);
+    engine.dispose();
+  });
   it('rejects overlap and terminates immediately on cancel without accepting new work', async () => {
     const engine = new TtsEngine(); const first = engine.generate(options, () => {});
     await expect(engine.generate(options, () => {})).rejects.toThrow('이미 음성을 생성 중');

@@ -93,6 +93,38 @@ describe('TTS PCM cue timeline', () => {
     expect(result.duration).toBeCloseTo(0.34);
     expect(result.blob.type).toBe('audio/mpeg');
   });
+
+  it.each(['ko', 'en'] as const)('adds only exact original boundary whitespace without changing %s chunks or timings', async lang => {
+    const h = workerHarness();
+    const limit = lang === 'ko' ? 120 : 240;
+    const text = 'x'.repeat(limit - 1) + 'a  b' + 'x'.repeat(limit);
+    const originalChunks: string[] = h.api.splitText(text, lang);
+    const result = await h.api.render(mockEngine('wasm'), { ...settings, text, lang }, { dp: {}, ttl: {} });
+    expect(result.cues.map((c: { text: string }) => c.text)).toEqual(originalChunks);
+    expect(result.cues[0].text.endsWith('a')).toBe(true);
+    expect(result.cues[1].sourceBefore).toBe('  ');
+    expect(result.cues[0]).toMatchObject({ start: 0, duration: 0.02 });
+    expect(result.cues[1]).toMatchObject({ start: 0.32, duration: 0.02 });
+  });
+
+  it('does not certify boundaries touching altered sentence spacing or filtered-out chunks', async () => {
+    const h = workerHarness();
+    const altered = await h.api.render(mockEngine('wasm'), { ...settings, text: 'Alpha!  Bravo! ' + 'x'.repeat(500) }, { dp: {}, ttl: {} });
+    expect(altered.cues[0].text).toBe('Alpha! Bravo!');
+    expect(altered.cues[1].sourceBefore).toBeUndefined();
+    const skipped = await h.api.render(mockEngine('wasm'), { ...settings, text: 'A\n\n👩‍👩‍👧‍👦\n\nB' }, { dp: {}, ttl: {} });
+    expect(skipped.cues.map((c: { text: string }) => c.text)).toEqual(['A', 'B']);
+    expect(skipped.cues[1].sourceBefore).toBeUndefined();
+  });
+
+  it('certifies a hard split and real paragraph whitespace without Intl.Segmenter', async () => {
+    const h = workerHarness({ noSegmenter: true });
+    const text = '가'.repeat(119) + '나다' + '가'.repeat(100) + '\n\n끝';
+    const result = await h.api.render(mockEngine('wasm'), { ...settings, text, lang: 'ko' }, { dp: {}, ttl: {} });
+    expect(result.cues.map((c: { text: string }) => c.text)).toEqual(h.api.splitText(text, 'ko'));
+    expect(result.cues[1].sourceBefore).toBe('');
+    expect(result.cues[2].sourceBefore).toBe('\n\n');
+  });
 });
 
 describe('TTS GPU fallback boundaries', () => {

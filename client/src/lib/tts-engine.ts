@@ -10,6 +10,8 @@ export interface TtsCue {
   text: string;
   start: number;
   duration: number;
+  /** Exact original whitespace between the previous cue and this one, if verified. */
+  sourceBefore?: string;
 }
 
 export interface TtsResult {

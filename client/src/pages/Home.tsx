@@ -4,10 +4,11 @@ import {
   FileText, Headphones, Info, LoaderCircle, Pause, Play, Sparkles, Upload, Volume2,
 } from "lucide-react";
 import { TtsEngine } from "@/lib/tts-engine";
-import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type MixOptions } from "@/lib/soundscape";
+import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type MixOptions, type SoundRuleSettings } from "@/lib/soundscape";
 import { extractManuscript } from "@/lib/manuscript-import";
 import BatchConverter from "@/components/BatchConverter";
 import QualityPanel from "@/components/QualityPanel";
+import SoundRules, { readSoundRules, saveSoundRules } from "@/components/SoundRules";
 
 type Language = "ko" | "en";
 type PresetId = "narration" | "balanced" | "immersive";
@@ -73,6 +74,9 @@ export default function Home() {
   const [spatial, setSpatial] = useState(true);
   const [musicVolume, setMusicVolume] = useState(0.5);
   const [effectsVolume, setEffectsVolume] = useState(0.5);
+  const [soundRuleState, setSoundRuleState] = useState(readSoundRules);
+  const soundRuleStateRef = useRef(soundRuleState);
+  const soundRuleSaveQueue = useRef<Promise<void>>(Promise.resolve());
   const [playVersion, setPlayVersion] = useState<"mixed" | "voice">("voice");
   // Async mix completions must use the latest user choice, not the render that started the mix.
   const playVersionRef = useRef<"mixed" | "voice">("voice");
@@ -95,7 +99,7 @@ export default function Home() {
   const pendingFocus = useRef<{ origin: HTMLElement; target: () => HTMLElement | null } | null>(null);
   const selectedVoice = voices.find(item => item.id === voice)!;
   const resultIsOutdated = result && (result.text !== text.trim() || result.title !== (title.trim() || "나의 오디오북") || result.voice !== voice || result.lang !== lang || result.speed !== speed);
-  const currentMix: MixOptions = { music, effects, musicVolume, effectsVolume, spatial };
+  const currentMix: MixOptions = { music, effects, musicVolume, effectsVolume, spatial, soundRules: soundRuleState.settings };
   const settingsChanged = result?.mixOptions && JSON.stringify(result.mixOptions) !== JSON.stringify(currentMix);
   const mixComponents = [
     result?.mixOptions?.music && result.mixOptions.musicVolume > 0 ? "배경 음악" : "",
@@ -200,6 +204,18 @@ export default function Home() {
     setSpeed(preset.speed);
     setMusicVolume(preset.musicVolume);
     setSelectedPreset(preset.id);
+  };
+
+  const updateSoundRules = (settings: SoundRuleSettings) => {
+    const current = { ...soundRuleStateRef.current, settings };
+    soundRuleStateRef.current = current;
+    setSoundRuleState(current);
+    soundRuleSaveQueue.current = soundRuleSaveQueue.current.then(async () => {
+      const saved = await saveSoundRules(settings, soundRuleStateRef.current.snapshot);
+      const next = { ...soundRuleStateRef.current, ...saved };
+      soundRuleStateRef.current = next;
+      setSoundRuleState(next);
+    });
   };
 
   const playPreview = async (id: string) => {
@@ -525,6 +541,7 @@ export default function Home() {
                   </details>
                   <p>음향 포함 작업은 최대 10분까지 지원합니다. 배경 음악은 별도 시험용 AI 자산이므로 상업 배포 전 이용 권리를 확인해 주세요.</p>
                 </fieldset>
+                <SoundRules value={soundRuleState.settings} onChange={updateSoundRules} disabled={busy} storageError={soundRuleState.warning} />
                 <button ref={generateButton} type="button" className="generate-btn" onClick={() => void generate()} disabled={busy || batchBusy || qualityBusy || fileLoading}>{busy ? <><LoaderCircle size={18} className="spin" /> 제작 중이에요</> : <><Sparkles size={18} /> 오디오 만들기 <ArrowRight size={17} /></>}</button>
                 {fileLoading && <p className="batch-busy-note" role="status">원고 파일을 읽는 중입니다. 읽기가 끝난 뒤 오디오를 제작할 수 있어요.</p>}
                 {batchBusy && <p className="batch-busy-note" role="status">일괄 변환 또는 ZIP 준비가 진행 중입니다. 끝난 뒤 오디오를 제작할 수 있어요.</p>}
@@ -567,7 +584,7 @@ export default function Home() {
                   {result.warnings?.map((warning, index) => <p className="sound-warning" key={`${index}-${warning}`}>{warning}</p>)}
                   {settingsChanged && <p className="sound-warning">음향 설정을 변경했습니다. 아래 버튼으로 기존 낭독에 다시 적용해 주세요.</p>}
                   {(settingsChanged || (!result.mixOptions && (music || effects))) && <button ref={remixButton} type="button" className="remix-btn" onClick={() => void remix()} disabled={busy || batchBusy || qualityBusy || fileLoading}>완성된 낭독에 음향 설정 다시 적용</button>}
-                  <p className="result-disclaimer">음향 파일은 합쳐진 MP3라서 재생 중 소리별 조절은 되지 않습니다. 새로 제작하면 기존 결과가 교체되므로 필요한 파일은 먼저 다운로드해 주세요. 새로고침하거나 페이지를 떠나면 화면의 결과는 사라집니다. 다운로드 클릭은 저장을 보장하지 않으므로 브라우저에서 실제 저장 여부를 확인해 주세요. 이탈 경고는 브라우저 상황에 따라 나타나지 않을 수 있습니다.</p></div> : <div className="output-empty"><div className="empty-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><strong>아직 만들어진 오디오가 없어요</strong><p>원고와 목소리를 선택하고<br />오디오를 만들어 보세요.</p></div>}
+                  <p className="result-disclaimer">음향 파일은 합쳐진 MP3라서 재생 중 소리별 조절은 되지 않습니다. 새 낭독이 완성되면 기존 결과가 교체됩니다. 이후 음향 처리 중 취소해도 이전 결과는 복구되지 않으므로 필요한 파일은 먼저 다운로드해 주세요. 새로고침하거나 페이지를 떠나면 화면의 결과는 사라집니다. 다운로드 클릭은 저장을 보장하지 않으므로 브라우저에서 실제 저장 여부를 확인해 주세요. 이탈 경고는 브라우저 상황에 따라 나타나지 않을 수 있습니다.</p></div> : <div className="output-empty"><div className="empty-wave"><span /><span /><span /><span /><span /><span /><span /><span /><span /></div><strong>아직 만들어진 오디오가 없어요</strong><p>원고와 목소리를 선택하고<br />오디오를 만들어 보세요.</p></div>}
                 {result && <a className="quality-shortcut" href="#quality-panel">완성된 오디오 자동 점검 결과 보기 <ArrowRight size={14} aria-hidden="true" /></a>}
               </section>
               <div className="model-note"><CircleHelp size={15} /><p>처음 제작할 때 낭독 모델 약 380MB를 다운로드합니다. TinyAudio 효과음은 미리 제작된 파일을 사용하며 별도 모델 다운로드가 필요하지 않습니다.</p></div>

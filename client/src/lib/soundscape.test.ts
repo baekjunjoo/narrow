@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type MixOptions } from './soundscape';
+import { hasPendingSoundscapeWork, mixSoundscape, waitForSoundscapeIdle, type Cue, type CustomSoundRule, type EffectName, type MixOptions, type SoundRuleSettings } from './soundscape';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+import ts from 'typescript';
 
 const encoded = vi.hoisted(() => ({
   settings: [] as { channels: number; rate: number; bitrate: number }[],
@@ -1147,5 +1150,402 @@ describe('mixSoundscape', () => {
     expect(offlineInstances).toHaveLength(0);
     await expect(mixSoundscape(voice(), [], { ...options, effects: false })).resolves.toMatchObject({ blob: expect.any(Blob) });
     expect(renderStarts).toBe(1);
+  });
+});
+
+describe('custom sound rules', () => {
+  const rule = (phrase: string, effect: EffectName, id = phrase.trim().normalize('NFC'), enabled = true): CustomSoundRule => ({ id, phrase, effect, enabled });
+  const settings = (customRules: CustomSoundRule[] = [], disabledBuiltins: EffectName[] = []): SoundRuleSettings => ({ customRules, disabledBuiltins });
+  const withRules = (soundRules: SoundRuleSettings): MixOptions => ({ ...options, soundRules });
+
+  it('preserves default events, warnings, scheduled sources, encoded output and requests when rules are omitted or empty', async () => {
+    const cues = [cue('rain', 0), cue('opened the door', 1), cue('forest', 12)];
+    const original = await mixSoundscape(voice(), cues, options);
+    const firstSources = offlineInstances[0].sources.map(({ startTime, stopTime }) => ({ startTime, stopTime }));
+    const originalBytes = Array.from(new Uint8Array(await original.blob.arrayBuffer()));
+    for (const config of [settings(), null, undefined, {}, [], 42, 'bad']) {
+      vi.mocked(fetch).mockClear();
+      const current = await mixSoundscape(voice(), cues, { ...options, soundRules: config } as MixOptions);
+      expect(current.events).toEqual(original.events);
+      expect(current.warnings).toEqual(original.warnings);
+      expect(Array.from(new Uint8Array(await current.blob.arrayBuffer()))).toEqual(originalBytes);
+      expect(offlineInstances.at(-1)!.sources.map(({ startTime, stopTime }) => ({ startTime, stopTime }))).toEqual(firstSources);
+      expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+    }
+  });
+
+  it.each([
+    ['rain', 'rain', 'drizzle', '빗소리'],
+    ['forest', 'forest', 'thicket', '숲'],
+    ['ocean', 'ocean', 'seashore', '바다'],
+    ['footsteps', 'footsteps', 'pattering', '발소리'],
+    ['door', 'opened the door', 'creaking portal', '문 여닫는 소리'],
+    ['page', 'turned the page', 'rustling paper', '책장 넘기는 소리'],
+  ] as [EffectName, string, string, string][])('disables only built-in %s while its enabled custom rule still mixes', async (effect, builtin, customPhrase, label) => {
+    const config = settings([rule(customPhrase, effect)], [effect]);
+    const disabled = await mixSoundscape(voice(), [cue(builtin)], withRules(config));
+    expect(disabled.events).toEqual([]);
+    const enabled = await mixSoundscape(voice(), [cue(customPhrase)], withRules(config));
+    expect(enabled.events.map((event) => event.label)).toEqual([label]);
+    expect(offlineInstances.at(-1)!.sources).toHaveLength(2);
+    expect(offlineInstances.at(-1)!.sources[1].startTime).toBe(enabled.events[0].time);
+    expect(offlineInstances.at(-1)!.sources[1].stopTime).toBeGreaterThan(enabled.events[0].time);
+    const noLongerDisabled = await mixSoundscape(voice(), [cue(builtin)], withRules(settings()));
+    expect(noLongerDisabled.events.map((event) => event.label)).toEqual([label]);
+  });
+
+  it('allows a different built-in and multiple custom effects in the same cue', async () => {
+    const text = 'Rain fell. Later a mysterious creak echoed. Much later a silent clearing appeared.';
+    const result = await mixSoundscape(voice(), [cue(text, 0, 38)], withRules(settings([
+      rule('mysterious creak', 'door'), rule('silent clearing', 'forest'),
+    ], ['ocean'])));
+    expect(result.events.map((event) => event.label)).toEqual(['빗소리', '문 여닫는 소리', '숲']);
+    expect(result.warnings).toEqual([]);
+    expect(offlineInstances[0].sources.slice(1).map((source) => source.startTime)).toEqual(result.events.map((event) => event.time));
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+  });
+
+  it('does not let a disabled ambient built-in suppress a different inferred walking effect', async () => {
+    const result = await mixSoundscape(voice(), [cue('He walked into the forest.')], withRules(settings([], ['forest'])));
+    expect(result.events.map((event) => event.label)).toEqual(['발소리']);
+  });
+
+  it('uses trim, NFC and case-insensitive substring matching with original cue timing', async () => {
+    const composed = '앞부분 고요한 안개가 자욱했다';
+    const config = settings([rule('  고요한 안개  '.normalize('NFD'), 'rain')], ['rain']);
+    const first = await mixSoundscape(voice(), [cue(composed, 3, 25)], withRules(config));
+    const second = await mixSoundscape(voice(), [cue(composed.normalize('NFD'), 3, 25)], withRules(config));
+    expect(second.events).toEqual(first.events);
+    expect(first.events.map((event) => event.label)).toEqual(['빗소리']);
+    expect(first.events[0].time).toBeCloseTo(3 + 25 * composed.indexOf('고요한') / composed.length);
+    const english = await mixSoundscape(voice(), [cue('A RAINBOW appeared.')], withRules(settings([rule('rain', 'rain')], ['rain'])));
+    expect(english.events.map((event) => event.label)).toEqual(['빗소리']); // literal substring, not a word boundary
+  });
+
+  it('maps Unicode case expansion and supplementary characters back to the real cue position', async () => {
+    const text = '😀 ß TRIGGER near the end';
+    const result = await mixSoundscape(voice(), [cue(text, 2, 30)], withRules(settings([rule('trigger', 'door')], ['door'])));
+    expect(result.events[0].time).toBeCloseTo(2 + 30 * text.indexOf('TRIGGER') / text.length);
+    expect(offlineInstances[0].sources[1].startTime).toBe(result.events[0].time);
+    const expanded = await mixSoundscape(voice(), [cue('A ß B', 0, 20)], withRules(settings([rule('SS', 'rain')], ['rain'])));
+    expect(expanded.events[0].time).toBeCloseTo(20 * 2 / 'A ß B'.length);
+    const partial = await mixSoundscape(voice(), [cue('ß')], withRules(settings([rule('s', 'rain')], ['rain'])));
+    expect(partial.events).toEqual([]);
+  });
+
+  it('uses the same timing path for a custom match and the equivalent built-in', async () => {
+    const text = 'The narrator paused, then opened the door.';
+    const builtin = await mixSoundscape(voice(), [cue(text, 4, 25)], options);
+    const custom = await mixSoundscape(voice(), [cue(text, 4, 25)], withRules(settings([rule('opened the door', 'door')], ['door'])));
+    expect(custom.events).toEqual(builtin.events);
+    expect(offlineInstances[0].sources[1].startTime).toBe(offlineInstances[1].sources[1].startTime);
+  });
+
+  it.each(['.*', '(a+)+$', '[abc]', 'x|y', '\\d+'])('treats regexp syntax literally: %s', async (phrase) => {
+    const config = withRules(settings([rule(phrase, 'page')], ['page']));
+    const absent = await mixSoundscape(voice(), [cue('abcdef x y 123 aaaaaaaaaa')], config);
+    expect(absent.events).toEqual([]);
+    const present = await mixSoundscape(voice(), [cue(`literal ${phrase} here`)], config);
+    expect(present.events.map((event) => event.label)).toEqual(['책장 넘기는 소리']);
+  });
+
+  it('ignores duplicate and overlapping same-effect rules and built-ins without a spurious density warning', async () => {
+    const config = withRules(settings([
+      rule(' RAIN ', 'rain', '1'), rule('rain', 'rain', '2'), rule('ain', 'rain', '3'),
+      rule('thunderstorm', 'ocean', '4'), rule('thunder', 'ocean', '5'), rule('storm', 'ocean', '6'),
+    ]));
+    const result = await mixSoundscape(voice(), [cue('rain, and much later thunderstorm', 0, 38)], config);
+    expect(result.events.map((event) => event.label)).toEqual(['빗소리', '바다']);
+    expect(result.warnings).toEqual([]);
+    expect(offlineInstances[0].sources).toHaveLength(3);
+  });
+
+  it('does not merge different effects or separate occurrences, which still obey density and cooldown', async () => {
+    const config = withRules(settings([rule('chime', 'door', 'chime-door'), rule('chime', 'page', 'chime-page'), rule('drizzle', 'rain')], ['rain']));
+    const result = await mixSoundscape(voice(), [cue('chime', 0, 2), cue('drizzle', 5, 2), cue('drizzle', 15, 2), cue('drizzle', 36, 2)], config);
+    expect(result.events.map((event) => event.label)).toEqual(['문 여닫는 소리', '빗소리', '빗소리']);
+    expect(result.warnings.join(' ')).toContain('효과음 단서 2개'); // other effect at same location + rain cooldown
+  });
+
+  it('reuses local negation heuristics without treating another clause as negated', async () => {
+    const config = withRules(settings([rule('drizzle', 'rain'), rule('안개', 'forest')], ['rain', 'forest']));
+    for (const text of ['No drizzle.', '안개가 없었다.']) {
+      expect((await mixSoundscape(voice(), [cue(text)], config)).events).toEqual([]);
+    }
+    const result = await mixSoundscape(voice(), [cue('No drizzle, but later drizzle returned.', 0, 38)], config);
+    expect(result.events.map((event) => event.label)).toEqual(['빗소리']);
+    expect(result.events[0].time).toBeGreaterThan(15);
+  });
+
+  it('ignores malformed, empty and disabled rules but retains valid settings beside them', async () => {
+    const invalid = [
+      null, 1, 'bad', [], {}, { id: '', phrase: 'bad', effect: 'rain', enabled: true },
+      { id: 12, phrase: 'bad', effect: 'rain', enabled: true },
+      { id: ' padded ', phrase: 'bad', effect: 'rain', enabled: true },
+      { id: 'bad\u0000id', phrase: 'bad', effect: 'rain', enabled: true },
+      { id: 'a'.repeat(129), phrase: 'bad', effect: 'rain', enabled: true },
+      { id: 'x', phrase: '   ', effect: 'rain', enabled: true },
+      { id: 'x', phrase: null, effect: 'rain', enabled: true },
+      { id: 'x', phrase: 'bad', effect: 'music', enabled: true },
+      { id: 'x', phrase: 'bad', effect: 'rain', enabled: 'true' },
+      rule('bad', 'rain', 'disabled', false),
+    ];
+    const config = { customRules: [...invalid, rule('valid', 'door')], disabledBuiltins: ['rain', null, 'music', 1] } as unknown as SoundRuleSettings;
+    const result = await mixSoundscape(voice(), [cue('rain bad valid')], withRules(config));
+    expect(result.events.map((event) => event.label)).toEqual(['문 여닫는 소리']);
+    const partial = await mixSoundscape(voice(), [cue('rain')], withRules({ customRules: null, disabledBuiltins: ['rain'] } as unknown as SoundRuleSettings));
+    expect(partial.events).toEqual([]);
+    const otherPartial = await mixSoundscape(voice(), [cue('valid')], withRules({ customRules: [rule('valid', 'door')], disabledBuiltins: 'door' } as unknown as SoundRuleSettings));
+    expect(otherPartial.events.map((event) => event.label)).toEqual(['문 여닫는 소리']);
+  });
+
+  it('reserves a valid disabled rule ID and ignores subsequent rules using the same ID', async () => {
+    const config = withRules(settings([rule('unused', 'rain', 'same-id', false), rule('trigger', 'door', 'same-id')]));
+    expect((await mixSoundscape(voice(), [cue('trigger')], config)).events).toEqual([]);
+  });
+
+  it('examines at most the first 50 supplied entries, including invalid and disabled entries', async () => {
+    const entries = Array.from({ length: 49 }, (_, i) => rule(`unused-${i}`, 'rain', `id-${i}`, false));
+    entries.push(rule('number fifty', 'door', '50'));
+    entries.push(rule('number fifty one', 'page', '51'));
+    const config = withRules(settings(entries));
+    expect((await mixSoundscape(voice(), [cue('number fifty')], config)).events.map((event) => event.label)).toEqual(['문 여닫는 소리']);
+    expect((await mixSoundscape(voice(), [cue('number fifty one')], withRules(settings(entries.map((entry, index) => index === 49 ? rule('unused 50', 'door') : entry))))).events).toEqual([]);
+  });
+
+  it('accepts 80 normalized Unicode code points but ignores 81, including non-BMP characters', async () => {
+    for (const char of ['가', '😀']) {
+      const eighty = char.repeat(80);
+      const eightyOne = char.repeat(81);
+      const accepted = await mixSoundscape(voice(), [cue(eighty)], withRules(settings([rule(` ${eighty.normalize('NFD')} `, 'rain')], ['rain'])));
+      expect(accepted.events.map((event) => event.label)).toEqual(['빗소리']);
+      const rejected = await mixSoundscape(voice(), [cue(eightyOne)], withRules(settings([rule(eightyOne, 'rain')], ['rain'])));
+      expect(rejected.events).toEqual([]);
+    }
+  });
+
+  it('keeps asset requests fixed and private for custom matches, disabled rules, and no matches', async () => {
+    for (const [text, config] of [
+      ['secret phrase', settings([rule('secret phrase', 'page')])],
+      ['rain secret phrase', settings([rule('secret phrase', 'page', 'x', false)], ['rain'])],
+      ['unrelated', settings([rule('secret phrase', 'page')])],
+    ] as [string, SoundRuleSettings][]) {
+      vi.mocked(fetch).mockClear();
+      await mixSoundscape(voice(), [cue(text)], withRules(config));
+      expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+      for (const [, init] of vi.mocked(fetch).mock.calls) expect(init).toEqual({ credentials: 'same-origin', signal: undefined });
+    }
+  });
+
+  it('decodes the selected custom effect asset and applies the normal duration and error handling', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => ({
+      ok: true, arrayBuffer: async () => new Uint8Array([effectUrls.indexOf(url) + 1]).buffer,
+    })));
+    const config = withRules(settings([rule('secret chime', 'door')], ['door']));
+    const mixed = await mixSoundscape(voice(), [cue('secret chime')], config);
+    expect(mixed.events.map((event) => event.label)).toEqual(['문 여닫는 소리']);
+    expect(decodedAssetIds).toEqual([5]); // door, not an unrelated asset
+    expect(offlineInstances[0].sources[1].stopTime - offlineInstances[0].sources[1].startTime).toBeCloseTo(3);
+    assetDecodeFailure = 5;
+    vi.mocked(fetch).mockClear();
+    await expect(mixSoundscape(voice(), [cue('secret chime')], config)).rejects.toThrow('/soundscape/tinyaudio-v1/door.mp3');
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+  });
+
+  it('preserves effect-off, zero volume, final-tail and cancellation behavior for custom matches', async () => {
+    const config = settings([rule('chime', 'door')]);
+    for (const overrides of [{ effects: false }, { effectsVolume: 0 }]) {
+      vi.mocked(fetch).mockClear();
+      const result = await mixSoundscape(voice(), [cue('chime')], { ...withRules(config), ...overrides });
+      expect(result.events).toEqual([]);
+      expect(fetch).not.toHaveBeenCalled();
+    }
+    voiceDuration = 0.5;
+    const tooShort = await mixSoundscape(voice(), [cue('chime', 0, 0.5)], withRules(config));
+    expect(tooShort.events).toEqual([]);
+    expect(tooShort.warnings.join(' ')).toContain('재생 시간이 부족한 효과음');
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+    const controller = new AbortController();
+    const mixing = mixSoundscape(voice(), [cue('chime', 0, 0.5)], withRules(config), undefined, controller.signal);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+    controller.abort();
+    await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });
+  });
+});
+
+describe('custom rules at actual TTS chunk boundaries', () => {
+  // Execute the production splitter and renderer with model doubles, then pass
+  // the resulting cues unchanged into the production soundscape mixer.
+  async function generatedCues(text: string, lang: 'ko' | 'en' = 'ko'): Promise<Cue[]> {
+    const self = { location: { href: 'https://example.test/' }, postMessage: () => {} };
+    class Tensor { constructor(public type: string, public data: unknown, public dims: number[]) {} }
+    class Encoder { encodeBuffer() { return new Uint8Array([1]); } flush() { return new Uint8Array([2]); } }
+    const ort = { env: { wasm: {} }, Tensor };
+    const file = new URL('./tts-engine.worker.ts', import.meta.url);
+    const source = readFileSync(file, 'utf8').replace(/^import .*;\n/gm, '') + '\nglobalThis.__render = render;';
+    const js = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
+    const context = vm.createContext({ self, ort, Mp3Encoder: Encoder, wasmUrl: 'model.wasm', URL, Blob, Uint8Array, Float32Array, Int16Array, BigInt64Array, Math, Array, Intl, Number, Error, AbortSignal, Response, setTimeout, navigator: {} });
+    vm.runInContext(js, context, { filename: file.pathname });
+    const engine = {
+      backend: 'wasm', config: { ae: { sample_rate: 1000, base_chunk_size: 120 }, ttl: { chunk_compress_factor: 2, latent_dim: 2 } }, indexer: [],
+      sessions: {
+        duration: { run: async () => ({ duration: { data: [10] } }) },
+        encoder: { run: async () => ({ text_emb: {} }) },
+        vector: { run: async (args: any) => ({ denoised_latent: args.noisy_latent }) },
+        vocoder: { run: async () => ({ wav_tts: { data: new Float32Array(10000) } }) },
+      },
+    };
+    return (await context.__render(engine, { text, lang, voice: 'F1', speed: 1 }, { dp: {}, ttl: {} })).cues;
+  }
+  const config = (phrase: string, effect: EffectName = 'rain'): MixOptions => ({
+    ...options, soundRules: { disabledBuiltins: [effect], customRules: [{ id: 'rule', phrase, effect, enabled: true }] },
+  });
+
+  it('finds a literal phrase cut by the Korean hard chunk limit and uses the first cue clock', async () => {
+    const cues = await generatedCues('가'.repeat(119) + '나다' + '가'.repeat(100));
+    expect(cues).toHaveLength(2);
+    expect(cues[0].text.endsWith('나')).toBe(true);
+    expect(cues[1].text.startsWith('다')).toBe(true);
+    const result = await mixSoundscape(voice(), cues, config('나다'));
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0].label).toBe('빗소리');
+    expect(result.events[0].time).toBeCloseTo(cues[0].start + cues[0].duration * 119 / 120);
+  });
+
+  it.each([' ', '\n\n', '\t'])('does not invent a no-space match across an original %j boundary', async (gap) => {
+    const cues = await generatedCues('가'.repeat(119) + '나' + gap + '다' + '가'.repeat(100));
+    expect(cues.length).toBeGreaterThanOrEqual(2);
+    const result = await mixSoundscape(voice(), cues, config('나다'));
+    expect(result.events).toEqual([]);
+  });
+
+  it('matches a space only when the actual original space is present across the split', async () => {
+    const cues = await generatedCues('가'.repeat(119) + '나 다' + '가'.repeat(100));
+    const result = await mixSoundscape(voice(), cues, config('나 다'));
+    expect(result.events.map(event => event.label)).toEqual(['빗소리']);
+  });
+
+  it('retains the exact number of original spaces at a chunk boundary', async () => {
+    const cues = await generatedCues('가'.repeat(119) + '나  다' + '가'.repeat(100));
+    expect(cues[1].sourceBefore).toBe('  ');
+    expect((await mixSoundscape(voice(), cues, config('나 다'))).events).toEqual([]);
+    expect((await mixSoundscape(voice(), cues, config('나  다'))).events).toHaveLength(1);
+  });
+
+  it('uses the full local clause for a split custom phrase and suppresses explicit negation', async () => {
+    const cues = await generatedCues('가'.repeat(119) + '안개가 없었다.' + '가'.repeat(100));
+    const result = await mixSoundscape(voice(), cues, config('안개', 'forest'));
+    expect(result.events).toEqual([]);
+  });
+
+  it('preserves the exact paragraph delimiters, including across three cues', async () => {
+    const cues = await generatedCues('나\n\n다\n\n라');
+    expect(cues).toHaveLength(3);
+    expect(cues.slice(1).map(c => c.sourceBefore)).toEqual(['\n\n', '\n\n']);
+    const result = await mixSoundscape(voice(), cues, config('나\n\n다\n\n라', 'door'));
+    expect(result.events.map(event => event.label)).toEqual(['문 여닫는 소리']);
+    // Discrete sounds use the last cue; they do not use a fabricated merged clock.
+    expect(result.events[0].time).toBeCloseTo(cues[2].start);
+    expect((await mixSoundscape(voice(), cues, config('나다라'))).events).toEqual([]);
+  });
+
+  it('handles decomposed Hangul and case expansion at actual hard boundaries', async () => {
+    const korean = await generatedCues('가'.repeat(118) + '나' + '다'.normalize('NFD') + '가'.repeat(100));
+    expect(korean[0].text.endsWith('나')).toBe(true);
+    expect((await mixSoundscape(voice(), korean, config('나다'))).events).toHaveLength(1);
+    const english = await generatedCues('x'.repeat(239) + 'ßA' + 'x'.repeat(100), 'en');
+    expect(english[0].text.endsWith('ß')).toBe(true);
+    expect((await mixSoundscape(voice(), english, config('ssA'))).events).toHaveLength(1);
+    expect((await mixSoundscape(voice(), english, config('sA'))).events).toEqual([]);
+  });
+
+  it('keeps negation across a paragraph split rather than joining a denied event', async () => {
+    for (const [text, expected] of [['No dri\n\nzzle', 0], ['Some dri\n\nzzle', 1]] as const) {
+      const cues = await generatedCues(text, 'en');
+      expect(cues).toHaveLength(2);
+      const result = await mixSoundscape(voice(), cues, config('dri\n\nzzle'));
+      expect(result.events).toHaveLength(expected);
+    }
+  });
+
+  it('deduplicates overlapping custom rules and gives same-effect built-ins precedence across cues', async () => {
+    const cues = await generatedCues('나\n\n다');
+    const overlapping: MixOptions = { ...options, soundRules: { disabledBuiltins: ['rain'], customRules: [
+      { id: 'short', phrase: '나', effect: 'rain', enabled: true },
+      { id: 'long', phrase: '나\n\n다', effect: 'rain', enabled: true },
+    ] } };
+    const result = await mixSoundscape(voice(), cues, overlapping);
+    expect(result.events).toHaveLength(1);
+    expect(result.warnings.join(' ')).not.toContain('간격·반복');
+    const builtinCues = await generatedCues('foo\n\nrain', 'en');
+    const builtIn = await mixSoundscape(voice(), builtinCues, {
+      ...options, soundRules: { disabledBuiltins: [], customRules: [{ id: 'cross', phrase: 'foo\n\nrain', effect: 'rain', enabled: true }] },
+    });
+    expect(builtIn.events).toHaveLength(1);
+    expect(builtIn.events[0].time).toBeCloseTo(builtinCues[1].start);
+    expect(builtIn.warnings.join(' ')).not.toContain('간격·반복');
+  });
+
+  it('does not join legacy, malformed or time-overlapping cues and explains the limitation', async () => {
+    const cases: Cue[][] = [
+      [cue('나', 0, 5), cue('다', 6, 5)],
+      [cue('나', 0, 5), { ...cue('다', 6, 5), sourceBefore: 'not whitespace' }],
+      [cue('나', 0, 5), { ...cue('다', 4, 5), sourceBefore: '' }],
+    ];
+    for (const cues of cases) {
+      const result = await mixSoundscape(voice(), cues, config('나다'));
+      expect(result.events).toEqual([]);
+      expect(result.warnings.join(' ')).toContain('사용자 규칙');
+      expect(result.warnings.join(' ')).toContain('누락될 수');
+    }
+    const legacyMatch = await mixSoundscape(voice(), [cue('나다', 0, 4), cue('other', 6, 4)], config('나다'));
+    expect(legacyMatch.events).toHaveLength(1); // Legacy in-cue matches still work.
+    expect(legacyMatch.warnings.join(' ')).toContain('누락될 수');
+  });
+
+  it('leaves default built-in results unchanged when optional source metadata is present', async () => {
+    const cues = await generatedCues('rain\n\nopened the door', 'en');
+    const withoutMetadata = cues.map(({ text, start, duration }) => ({ text, start, duration }));
+    const original = await mixSoundscape(voice(), withoutMetadata, options);
+    const withMetadata = await mixSoundscape(voice(), cues, options);
+    expect(withMetadata.events).toEqual(original.events);
+    expect(withMetadata.warnings).toEqual(original.warnings);
+  });
+
+  it('uses normal final-tail omission for a discrete phrase ending in the last cue', async () => {
+    const cues = await generatedCues('나\n\n다\n\n라');
+    voiceDuration = cues[2].start + 0.5;
+    const result = await mixSoundscape(voice(), cues, config('나\n\n다\n\n라', 'door'));
+    expect(result.events).toEqual([]);
+    expect(result.warnings.join(' ')).toContain('재생 시간이 부족한 효과음');
+  });
+
+  it('warns instead of joining a chunk whose sentence spacing was changed by the splitter', async () => {
+    const cues = await generatedCues('Alpha!  Bravo! ' + 'x'.repeat(500), 'en');
+    expect(cues[0].text).toBe('Alpha! Bravo!');
+    expect(cues[1].sourceBefore).toBeUndefined();
+    const result = await mixSoundscape(voice(), cues, config('Bravo! x'));
+    expect(result.events).toEqual([]);
+    expect(result.warnings.join(' ')).toContain('누락될 수');
+  });
+
+  it('keeps fixed private asset requests and cancellation with cross-cue rules', async () => {
+    const cues = await generatedCues('가'.repeat(119) + '나다' + '가'.repeat(100));
+    await mixSoundscape(voice(), cues, config('나다'));
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(effectUrls);
+    for (const [, init] of vi.mocked(fetch).mock.calls) expect(init).toEqual({ credentials: 'same-origin', signal: undefined });
+    vi.stubGlobal('fetch', vi.fn(() => new Promise(() => {})));
+    const controller = new AbortController();
+    const mixing = mixSoundscape(voice(), cues, config('나다'), undefined, controller.signal);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalled());
+    controller.abort();
+    await expect(mixing).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it('retains earlier cue priority when old custom and built-in candidates share a timestamp', async () => {
+    const result = await mixSoundscape(voice(), [cue('chime', 0, 2), cue('rain', 0, 2)], {
+      ...options, soundRules: { disabledBuiltins: [], customRules: [{ id: 'chime', phrase: 'chime', effect: 'door', enabled: true }] },
+    });
+    expect(result.events.map(event => event.label)).toEqual(['문 여닫는 소리']);
   });
 });

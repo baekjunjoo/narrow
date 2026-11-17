@@ -339,6 +339,41 @@ function splitText(text: string, lang: TtsOptions['lang']): string[] {
   return result.filter(Boolean);
 }
 
+// splitText can trim whitespace or insert spaces when merging sentences. Align
+// the unchanged non-whitespace stream, but certify a boundary ONLY when both
+// complete chunks are exact original substrings and no chunk was skipped.
+// Never infer adjacency from the trimmed cue text alone.
+function sourceBoundaries(text: string, chunks: string[]): Array<string | undefined> {
+  const boundaries: Array<string | undefined> = [];
+  let cursor = 0;
+  let previousEnd = 0;
+  let previousExact = false;
+  let aligned = true;
+  for (const chunk of chunks) {
+    let start = -1, end = -1;
+    if (aligned) for (const character of chunk) {
+      if (/\s/u.test(character)) continue;
+      while (cursor < text.length) {
+        const sourceCharacter = String.fromCodePoint(text.codePointAt(cursor)!);
+        if (!/\s/u.test(sourceCharacter)) break;
+        cursor += sourceCharacter.length;
+      }
+      if (!text.startsWith(character, cursor)) { aligned = false; break; }
+      if (start < 0) start = cursor;
+      cursor += character.length;
+      end = cursor;
+    }
+    const exact = aligned && start >= 0 && text.slice(start, end) === chunk;
+    // Huge gaps cannot be part of an 80-code-point phrase. Avoid copying them
+    // into cue metadata; the mixer warns that this boundary was not checked.
+    const gap = exact && previousExact && start - previousEnd <= 512 ? text.slice(previousEnd, start) : undefined;
+    boundaries.push(gap !== undefined && /^\s*$/u.test(gap) ? gap : undefined);
+    previousExact = exact;
+    previousEnd = end;
+  }
+  return boundaries;
+}
+
 class GpuInferenceError extends Error {}
 
 function isGpuRuntimeFailure(error: unknown): boolean {
@@ -414,7 +449,9 @@ function appendPcm(encoder: Mp3Encoder, parts: Uint8Array[], samples: Float32Arr
 }
 
 async function render(e: Engine, options: TtsOptions, style: Style): Promise<TtsResult> {
-  const chunks = splitText(options.text, options.lang).filter(chunk => normalizeText(chunk, options.lang));
+  const split = splitText(options.text, options.lang);
+  const boundaries = sourceBoundaries(options.text, split);
+  const chunks = split.map((text, index) => ({ text, index })).filter(chunk => normalizeText(chunk.text, options.lang));
   if (!chunks.length) throw new Error('읽을 텍스트를 입력해 주세요.');
   const sampleRate = e.config.ae.sample_rate;
   const encoder = new Mp3Encoder(1, sampleRate, 128);
@@ -427,8 +464,10 @@ async function render(e: Engine, options: TtsOptions, style: Style): Promise<Tts
       appendPcm(encoder, parts, silence);
       sampleCount += silence.length;
     }
-    const wav = await synthesizeChunk(e, chunks[i], options, style, i, chunks.length);
-    cues.push({ text: chunks[i], start: sampleCount / sampleRate, duration: wav.length / sampleRate });
+    const wav = await synthesizeChunk(e, chunks[i].text, options, style, i, chunks.length);
+    const sourceBefore = i && chunks[i - 1].index + 1 === chunks[i].index ? boundaries[chunks[i].index] : undefined;
+    cues.push({ text: chunks[i].text, start: sampleCount / sampleRate, duration: wav.length / sampleRate,
+      ...(sourceBefore === undefined ? {} : { sourceBefore }) });
     appendPcm(encoder, parts, wav);
     sampleCount += wav.length;
   }
