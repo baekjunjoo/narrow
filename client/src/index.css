@@ -1553,15 +1553,15 @@ input:disabled, select:disabled, textarea:disabled { opacity: .8; cursor: not-al
 
 /* Quiet workspace theme. The earlier screen-reader and state rules remain intact. */
 :root {
-  --ui-ink: #172536;
-  --ui-muted: #405269;
-  --ui-blue: #1453a6;
-  --ui-blue-hover: #0f427f;
-  --ui-blue-soft: #edf4ff;
-  --ui-canvas: #f7f8f6;
-  --ui-subtle: #f2f5f8;
-  --ui-line: #d2dbe5;
-  --ui-control-line: #6b7d91;
+  --ui-ink: #181818;
+  --ui-muted: #414141;
+  --ui-blue: #171717;
+  --ui-blue-hover: #383838;
+  --ui-blue-soft: #eeece6;
+  --ui-canvas: #f7f6f1;
+  --ui-subtle: #f1f0eb;
+  --ui-line: #d6d4ce;
+  --ui-control-line: #777777;
   --purple: var(--ui-blue);
   --muted: var(--ui-muted);
   color: var(--ui-ink);
@@ -1596,7 +1596,7 @@ button, input, textarea, select { font: inherit; }
 .steps b, .section-number { color: var(--ui-blue); font-size: 11px; }
 .workspace-grid { grid-template-columns: minmax(0, 1.55fr) minmax(300px, 0.85fr); gap: 20px; }
 .left-column, .right-column { gap: 20px; }
-.panel { border-color: var(--ui-line); border-radius: 16px; box-shadow: 0 4px 18px #1725360a; }
+.panel { border-color: var(--ui-line); border-radius: 16px; box-shadow: 0 4px 18px #1111110a; }
 .manuscript-panel, .voices-panel, .settings-panel, .output-panel { padding: 26px; }
 .panel-header { gap: 16px; margin-bottom: 22px; }
 .panel-header h2, .output-heading h2 { color: var(--ui-ink); font-size: 18px; line-height: 1.35; letter-spacing: -0.035em; }
@@ -1661,19 +1661,19 @@ input[type="checkbox"], input[type="radio"], input[type="range"] { accent-color:
 .download-btn, .cancel-btn, .remix-btn { min-height: 42px; border-color: var(--ui-control-line); color: var(--ui-blue); background: #fff; font-size: 13px; }
 .download-btn:hover, .cancel-btn:hover:not(:disabled), .remix-btn:hover:not(:disabled) { background: var(--ui-blue-soft); }
 .progress-box, .cancel-notice, .cue-summary { background: var(--ui-subtle); }
-.progress-track { background: #a8b5c3; }
+.progress-track { background: #aaaaaa; }
 .progress-track span { background: var(--ui-blue); }
 .error-box, .audio-result .sound-warning, .audio-result .stale-notice, .editor-note[role="alert"] {
-  color: #8c2523;
-  background: #fff4f2;
-  border-left: 3px solid #8c2523;
+  color: #252525;
+  background: #f2f0eb;
+  border-left: 3px solid #252525;
   padding: 10px 12px;
 }
 .batch-shortcut a, .quality-shortcut, .quality-privacy a, footer a { color: var(--ui-blue); text-decoration: underline; text-underline-offset: 3px; }
 .batch-shortcut a:hover, .quality-shortcut:hover, .quality-privacy a:hover, footer a:hover { color: var(--ui-blue-hover); }
 footer { color: var(--ui-muted); font-size: 11px; }
 
-/* A visible two-colour focus treatment survives light and blue surfaces. */
+/* A visible two-colour focus treatment survives light and dark surfaces. */
 :is(button, input, textarea, select, a, summary, audio, [tabindex]):focus-visible,
 .title-input:focus-visible, .audio-result audio:focus-visible {
   outline: 3px solid var(--ui-blue);
@@ -1684,7 +1684,7 @@ footer { color: var(--ui-muted); font-size: 11px; }
 .editor-wrap textarea:focus-visible { outline: 3px solid var(--ui-blue); outline-offset: -3px; box-shadow: none; }
 .version-option:focus-within, .preset-option:focus-within { outline: 3px solid var(--ui-blue); outline-offset: 3px; }
 button:disabled, input:disabled, select:disabled, textarea:disabled { opacity: 1; cursor: not-allowed; }
-button:disabled, button[aria-disabled="true"] { color: #4c596b; background: #e9eef3; border: 1px dashed var(--ui-control-line); box-shadow: none; cursor: not-allowed; }
+button:disabled, button[aria-disabled="true"] { color: #474747; background: #e9e9e5; border: 1px dashed var(--ui-control-line); box-shadow: none; cursor: not-allowed; }
 .language-toggle button.active:disabled, .version-toggle button.active:disabled { color: #fff; background: var(--ui-blue); border: 1px dashed #fff; }
 
 /* Brief press feedback, with no motion when the user requests less movement. */
